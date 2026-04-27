@@ -1190,6 +1190,13 @@ async def handle_pm_text(message: Message):
     if not text:
         return
 
+    # КРИТИЧНО: пропускаем все slash-команды, чтобы их забрали настоящие
+    # @dp.message(Command(...)) обработчики ниже (/users, /stats, /ban,
+    # /unban, /broadcast, /alias). Без этой проверки catch-all PM-хендлер
+    # ловит «/users» первым и молча игнорирует — админ-команды не работают.
+    if text.startswith("/"):
+        return
+
     # Авто-скачивание URL — как в business-чате, но без удаления команды.
     if extract_url(text):
         await auto_download(message, bot)
