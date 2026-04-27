@@ -37,7 +37,7 @@ LOVE_LINES: list[list[int]] = [
     # строка 3 (5 эмодзи)
     [5384123212164532351, 5384101406615570174, 5384167123910163518, 5381906523708491747, 5382312123240056655],
     # строка 4 (5 эмодзи)
-    [5381948275085573986, 5384140456458222962, 5382298950575357422, 5382035419972009739, 5381803023586593728],
+    [5381948275085573986, 5384140456458222962, 5382035419972009739, 5382298950575357422, 5381803023586593728],
     # строка 5 (4 эмодзи)
     [5382313244226517423, 5384353924922769569, 5381937992933867807, 5381807808180157532],
     # строка 6 (4 эмодзи)
@@ -46,8 +46,9 @@ LOVE_LINES: list[list[int]] = [
 
 LOVE_HEART_ID: int = 5969864985067656768
 
-LOVE_LINE_INDENT: str = "    "  # 4 пробела для строк 1–6
-LOVE_FINAL_INDENT: str = "  "    # 2 пробела для строки 7
+LOVE_LINE_INDENT: str = "    "      # 4 пробела для строк 2–6
+LOVE_LINE1_INDENT: str = "       "  # 7 пробелов для строки 1 (она чуть смещена вправо)
+LOVE_FINAL_INDENT: str = "  "       # 2 пробела для строки 7
 LOVE_FINAL_TEXT: str = "I    love    you  "
 
 # Пауза между правками сообщения. Чем меньше — тем «бодрее» анимация,
@@ -75,7 +76,8 @@ def _build_love_snapshots() -> list[str]:
     current = ""
 
     for i, line in enumerate(LOVE_LINES):
-        line_prefix = ("\n" if i > 0 else "") + LOVE_LINE_INDENT
+        indent = LOVE_LINE1_INDENT if i == 0 else LOVE_LINE_INDENT
+        line_prefix = ("\n" if i > 0 else "") + indent
         for j, emoji_id in enumerate(line):
             current += (line_prefix if j == 0 else "") + _emoji_tag(emoji_id)
             snapshots.append(current)
