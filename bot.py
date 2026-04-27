@@ -1182,19 +1182,12 @@ async def handle_reciters_list_pm(message: Message):
 #   • «чтецы» / «список чтецов» → отвечаем списком;
 #   • «.люхайдан» / «люхайдан» (любой алиас чтеца) → список доступных сур.
 # Молча игнорируем всё остальное, чтобы не отвечать на болтовню в ЛС.
-@dp.message(F.chat.type == "private")
+@dp.message(F.chat.type == "private", ~F.text.startswith("/"))
 async def handle_pm_text(message: Message):
     if message.from_user and message.from_user.id in banned_users:
         return
     text = (message.text or "").strip()
     if not text:
-        return
-
-    # КРИТИЧНО: пропускаем все slash-команды, чтобы их забрали настоящие
-    # @dp.message(Command(...)) обработчики ниже (/users, /stats, /ban,
-    # /unban, /broadcast, /alias). Без этой проверки catch-all PM-хендлер
-    # ловит «/users» первым и молча игнорирует — админ-команды не работают.
-    if text.startswith("/"):
         return
 
     # Авто-скачивание URL — как в business-чате, но без удаления команды.
