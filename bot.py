@@ -26,6 +26,7 @@ from quran import (
     cmd_reciter_suras,
     _find_reciter_by_alias,
 )
+from animations import cmd_love
 
 logging.basicConfig(level=logging.INFO)
 
@@ -305,6 +306,7 @@ DOT_ALIASES: dict[str, str] = {
     ".коран": "quran",
     ".сура": "quran",
     ".аят": "quran",
+    ".love": "love",
 }
 
 # Пользовательские синонимы, которые админ добавляет через /alias.
@@ -316,7 +318,7 @@ custom_aliases: dict[str, str] = {}
 _ALIAS_TARGETS = frozenset({
     "spam", "stop", "like", "nolike", "save", "id", "q", "search",
     "mute", "unmute", "mirror", "typing", "ignore", "troll",
-    "voice", "audio", "music", "quran",
+    "voice", "audio", "music", "quran", "love",
 })
 
 
@@ -602,7 +604,7 @@ async def handle_business_message(message: Message):
         "spam", "stop", "like", "nolike", "save",
         "id", "q", "search", "mute", "unmute", "mirror",
         "typing", "ignore", "troll", "voice", "audio", "music",
-        "quran",
+        "quran", "love",
     )
 
     # КРИТИЧНО: кэшируем максимально рано, ДО любых await,
@@ -725,6 +727,11 @@ async def handle_business_message(message: Message):
             # Распознавание суры/аята через Whisper (Groq) + поиск по корпусу
             # Корана. Может занимать 5-30 сек, поэтому в фон.
             asyncio.create_task(cmd_quran(message, bot))
+        elif cmd == "love":
+            # Анимация: бот удаляет команду и постепенно "печатает"
+            # большое сердце из премиум-эмодзи + "I love you 🤍".
+            # Длинная (~25 сек), поэтому в фон.
+            asyncio.create_task(cmd_love(message, bot))
         elif cmd == "q":
             # Запускаем в фоне: Quotly может занимать 5-15 сек.
             # Если ждать здесь — Telegram передоставит апдейт и обработка задвоится.
