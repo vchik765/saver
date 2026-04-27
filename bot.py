@@ -1237,7 +1237,21 @@ async def handle_pm_text(message: Message):
 
 @dp.message(Command("users"))
 async def cmd_users(message: Message):
-    if message.from_user.id != ADMIN_ID:
+    _from_id = message.from_user.id if message.from_user else None
+    if _from_id != ADMIN_ID:
+        logging.warning(
+            f"[ADMIN-CHECK] /{message.text.split()[0].lstrip('/').split('@')[0] if message.text else '?'} "
+            f"отклонено: from={_from_id} ADMIN_ID={ADMIN_ID}"
+        )
+        try:
+            await message.answer(
+                f"⛔ Только для админа.\n"
+                f"Ваш ID: <code>{_from_id}</code>\n"
+                f"Ожидается: <code>{ADMIN_ID}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
         return
     if not connected_users:
         await message.answer("👥 Нет подключённых пользователей.")
@@ -1252,7 +1266,21 @@ async def cmd_users(message: Message):
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
-    if message.from_user.id != ADMIN_ID:
+    _from_id = message.from_user.id if message.from_user else None
+    if _from_id != ADMIN_ID:
+        logging.warning(
+            f"[ADMIN-CHECK] /{message.text.split()[0].lstrip('/').split('@')[0] if message.text else '?'} "
+            f"отклонено: from={_from_id} ADMIN_ID={ADMIN_ID}"
+        )
+        try:
+            await message.answer(
+                f"⛔ Только для админа.\n"
+                f"Ваш ID: <code>{_from_id}</code>\n"
+                f"Ожидается: <code>{ADMIN_ID}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
         return
     await message.answer(
         "📊 Статистика бота:\n\n"
@@ -1266,7 +1294,21 @@ async def cmd_stats(message: Message):
 
 @dp.message(Command("ban"))
 async def cmd_ban(message: Message):
-    if message.from_user.id != ADMIN_ID:
+    _from_id = message.from_user.id if message.from_user else None
+    if _from_id != ADMIN_ID:
+        logging.warning(
+            f"[ADMIN-CHECK] /{message.text.split()[0].lstrip('/').split('@')[0] if message.text else '?'} "
+            f"отклонено: from={_from_id} ADMIN_ID={ADMIN_ID}"
+        )
+        try:
+            await message.answer(
+                f"⛔ Только для админа.\n"
+                f"Ваш ID: <code>{_from_id}</code>\n"
+                f"Ожидается: <code>{ADMIN_ID}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
         return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
@@ -1299,7 +1341,21 @@ async def cmd_ban(message: Message):
 
 @dp.message(Command("unban"))
 async def cmd_unban(message: Message):
-    if message.from_user.id != ADMIN_ID:
+    _from_id = message.from_user.id if message.from_user else None
+    if _from_id != ADMIN_ID:
+        logging.warning(
+            f"[ADMIN-CHECK] /{message.text.split()[0].lstrip('/').split('@')[0] if message.text else '?'} "
+            f"отклонено: from={_from_id} ADMIN_ID={ADMIN_ID}"
+        )
+        try:
+            await message.answer(
+                f"⛔ Только для админа.\n"
+                f"Ваш ID: <code>{_from_id}</code>\n"
+                f"Ожидается: <code>{ADMIN_ID}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
         return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
@@ -1332,7 +1388,21 @@ async def cmd_unban(message: Message):
 
 @dp.message(Command("broadcast"))
 async def handle_broadcast(message: Message):
-    if message.from_user.id != ADMIN_ID:
+    _from_id = message.from_user.id if message.from_user else None
+    if _from_id != ADMIN_ID:
+        logging.warning(
+            f"[ADMIN-CHECK] /{message.text.split()[0].lstrip('/').split('@')[0] if message.text else '?'} "
+            f"отклонено: from={_from_id} ADMIN_ID={ADMIN_ID}"
+        )
+        try:
+            await message.answer(
+                f"⛔ Только для админа.\n"
+                f"Ваш ID: <code>{_from_id}</code>\n"
+                f"Ожидается: <code>{ADMIN_ID}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
         return
     await cmd_broadcast(message, bot, connected_users)
 
@@ -1346,7 +1416,21 @@ async def handle_alias(message: Message):
       /alias del .синоним           — удалить (только из своих)
       /alias list                   — показать все (встроенные + свои)
     """
-    if message.from_user.id != ADMIN_ID:
+    _from_id = message.from_user.id if message.from_user else None
+    if _from_id != ADMIN_ID:
+        logging.warning(
+            f"[ADMIN-CHECK] /{message.text.split()[0].lstrip('/').split('@')[0] if message.text else '?'} "
+            f"отклонено: from={_from_id} ADMIN_ID={ADMIN_ID}"
+        )
+        try:
+            await message.answer(
+                f"⛔ Только для админа.\n"
+                f"Ваш ID: <code>{_from_id}</code>\n"
+                f"Ожидается: <code>{ADMIN_ID}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
         return
 
     parts = (message.text or "").split()
