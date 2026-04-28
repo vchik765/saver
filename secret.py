@@ -1,14 +1,12 @@
-"""Команда /secret — одноразовое сообщение через бизнес-аккаунт.
+"""Команда /secret — одноразовое секретное сообщение через бизнес-аккаунт.
 
 Поток:
-1. Владелец бизнес-подключения пишет в ЛС с ботом любое сообщение
-   (текст / фото / видео / голосовое / документ — что угодно).
+1. Владелец бизнес-подключения пишет в ЛС с ботом любой текст.
 2. Реплаит на это сообщение командой:
-       /secret <user|id> <время>
+       /secret <user|id>
    Примеры:
-       /secret @vasya 30сек
-       /secret 12345 1мин
-       /secret @vasya 5мин
+       /secret @vasya
+       /secret 12345
 
 3. Бот через бизнес-подключение отправителя посылает получателю
    «конверт» — короткое сообщение с inline-кнопкой «📩 Открыть».
@@ -16,24 +14,26 @@
 4. Если получатель не открыл конверт за SECRET_UNOPENED_TTL секунд —
    конверт автоматически удаляется.
 5. Когда получатель нажимает «Открыть»:
-       • конверт удаляется,
-       • в этот же чат приходит реальное содержимое
-         (с protect_content=True — нельзя переслать/сохранить/скопировать),
-       • запускается таймер на указанное в команде время,
-         после которого содержимое тоже удаляется.
-   Кнопку можно нажать только один раз — повторный тап получит
-   ответ «уже прочитано».
-6. Админу (ADMIN_ID) одновременно прилетает копия в обычном виде,
-   без таймеров и защиты — для архива/контроля.
+       • Telegram показывает у него нативное всплывающее окно
+         (alert с кнопкой «OK») с текстом секретного сообщения,
+       • конверт сразу удаляется.
+   После того как получатель нажмёт «OK» — окно закроется и
+   текст исчезнет навсегда. Восстановить или открыть второй раз
+   нельзя — кнопка одноразовая.
+
+   ⚠ Из-за того что используется alert, поддерживается только
+   текст (не медиа). Лимит Telegram на текст алерта — 200 символов.
+
+6. Админу (ADMIN_ID) одновременно прилетает копия текста с шапкой
+   (от кого, кому) — для архива/контроля.
 
 ⚠ Состояние конвертов хранится в памяти. Если Railway перезапустит
 бота — все «незакрытые» секреты пропадут (получатель уже не сможет
-их открыть, но и удалить их тогда некому).
+их открыть, а сам конверт удалить тогда некому).
 """
 
 import asyncio
 import logging
-import re
 from secrets import token_urlsafe
 
 from aiogram import Bot
@@ -52,9 +52,8 @@ from fun import delete_command, get_display_name
 # Сколько секунд конверт ждёт открытия. После — авто-удаление.
 SECRET_UNOPENED_TTL: int = 60
 
-# Допустимый диапазон таймера на чтение после открытия (секунды).
-SECRET_READ_MIN: int = 1
-SECRET_READ_MAX: int = 3600  # 1 час
+# Лимит Telegram на текст в callback-alert.
+SECRET_TEXT_MAX: int = 200
 
 # Длина случайного id для callback_data (Telegram лимит — 64 байта).
 SECRET_ID_LEN: int = 12
@@ -62,82 +61,12 @@ SECRET_ID_LEN: int = 12
 
 # === Состояние =======================================================
 
-# secret_id -> запись с метаданными и сохранённым содержимым.
+# secret_id -> запись с метаданными и сохранённым текстом.
 _secrets: dict[str, dict] = {}
 
 
 def _new_secret_id() -> str:
     return token_urlsafe(SECRET_ID_LEN)[:SECRET_ID_LEN]
-
-
-# === Парсинг времени ================================================
-
-_TIME_RE = re.compile(
-    r"^(\d+)\s*(sec|сек|s|min|мин|m|h|ч|hour|час)?$",
-    re.IGNORECASE,
-)
-
-
-def _parse_time(s: str) -> float | None:
-    """«30сек» / «1мин» / «2ч» / «10» (по умолчанию секунды) → float секунд.
-    Возвращает None при некорректном формате или выходе за лимиты.
-    """
-    s = s.strip().lower()
-    m = _TIME_RE.match(s)
-    if not m:
-        return None
-    n = int(m.group(1))
-    unit = (m.group(2) or "сек").lower()
-    if unit in ("s", "sec", "сек"):
-        secs = n
-    elif unit in ("m", "min", "мин"):
-        secs = n * 60
-    elif unit in ("h", "hour", "ч", "час"):
-        secs = n * 3600
-    else:
-        return None
-    if secs < SECRET_READ_MIN or secs > SECRET_READ_MAX:
-        return None
-    return float(secs)
-
-
-def _format_secs(secs: float) -> str:
-    s = int(secs)
-    if s < 60:
-        return f"{s} сек"
-    if s < 3600:
-        m, rem = divmod(s, 60)
-        return f"{m} мин" + (f" {rem} сек" if rem else "")
-    h, rem_s = divmod(s, 3600)
-    rem_m = rem_s // 60
-    return f"{h} ч" + (f" {rem_m} мин" if rem_m else "")
-
-
-# === Извлечение содержимого =========================================
-
-def _extract_content(msg: Message) -> dict | None:
-    """Достаёт из сообщения тип + file_id/текст в плоский dict.
-    Возвращает None если в сообщении нет ничего полезного."""
-    cap = msg.caption or None
-    if msg.text:
-        return {"kind": "text", "text": msg.text}
-    if msg.photo:
-        return {"kind": "photo", "file_id": msg.photo[-1].file_id, "caption": cap}
-    if msg.video:
-        return {"kind": "video", "file_id": msg.video.file_id, "caption": cap}
-    if msg.animation:
-        return {"kind": "animation", "file_id": msg.animation.file_id, "caption": cap}
-    if msg.voice:
-        return {"kind": "voice", "file_id": msg.voice.file_id, "caption": cap}
-    if msg.audio:
-        return {"kind": "audio", "file_id": msg.audio.file_id, "caption": cap}
-    if msg.video_note:
-        return {"kind": "video_note", "file_id": msg.video_note.file_id}
-    if msg.sticker:
-        return {"kind": "sticker", "file_id": msg.sticker.file_id}
-    if msg.document:
-        return {"kind": "document", "file_id": msg.document.file_id, "caption": cap}
-    return None
 
 
 # === Резолв получателя ===============================================
@@ -173,74 +102,6 @@ async def _resolve_target(bot: Bot, raw: str) -> tuple[int | None, str]:
         )
 
 
-# === Отправка содержимого через бизнес-подключение ==================
-
-async def _send_content_via_bc(
-    bot: Bot,
-    chat_id: int,
-    bc_id: str,
-    content: dict,
-    protect: bool = True,
-) -> Message | None:
-    """Отправляет сохранённое содержимое в чат от имени владельца
-    бизнес-подключения. Возвращает Message или None при неизвестном типе."""
-    kind = content["kind"]
-    cap = content.get("caption")
-    kw = dict(chat_id=chat_id, business_connection_id=bc_id, protect_content=protect)
-    if kind == "text":
-        return await bot.send_message(text=content["text"], **kw)
-    if kind == "photo":
-        return await bot.send_photo(photo=content["file_id"], caption=cap, **kw)
-    if kind == "video":
-        return await bot.send_video(video=content["file_id"], caption=cap, **kw)
-    if kind == "animation":
-        return await bot.send_animation(animation=content["file_id"], caption=cap, **kw)
-    if kind == "voice":
-        return await bot.send_voice(voice=content["file_id"], caption=cap, **kw)
-    if kind == "audio":
-        return await bot.send_audio(audio=content["file_id"], caption=cap, **kw)
-    if kind == "document":
-        return await bot.send_document(document=content["file_id"], caption=cap, **kw)
-    if kind == "video_note":
-        return await bot.send_video_note(video_note=content["file_id"], **kw)
-    if kind == "sticker":
-        return await bot.send_sticker(sticker=content["file_id"], **kw)
-    return None
-
-
-# === Копия для админа =================================================
-
-async def _send_admin_copy(bot: Bot, admin_id: int, content: dict, header: str) -> None:
-    """Отсылает админу копию секретного сообщения с шапкой,
-    БЕЗ protect_content и без таймера."""
-    kind = content["kind"]
-    cap = content.get("caption")
-    full_cap = header + (f"\n\n{cap}" if cap else "")
-    try:
-        if kind == "text":
-            await bot.send_message(admin_id, f"{header}\n\n{content['text']}")
-        elif kind == "photo":
-            await bot.send_photo(admin_id, content["file_id"], caption=full_cap)
-        elif kind == "video":
-            await bot.send_video(admin_id, content["file_id"], caption=full_cap)
-        elif kind == "animation":
-            await bot.send_animation(admin_id, content["file_id"], caption=full_cap)
-        elif kind == "voice":
-            await bot.send_voice(admin_id, content["file_id"], caption=full_cap)
-        elif kind == "audio":
-            await bot.send_audio(admin_id, content["file_id"], caption=full_cap)
-        elif kind == "document":
-            await bot.send_document(admin_id, content["file_id"], caption=full_cap)
-        elif kind == "video_note":
-            await bot.send_message(admin_id, header)
-            await bot.send_video_note(admin_id, content["file_id"])
-        elif kind == "sticker":
-            await bot.send_message(admin_id, header)
-            await bot.send_sticker(admin_id, content["file_id"])
-    except Exception as e:
-        logging.error(f"/secret: не удалось отправить копию админу: {e}")
-
-
 # === Удаление сообщения через бизнес-подключение ====================
 
 async def _delete_business_msg(
@@ -273,16 +134,18 @@ async def _delete_business_msg(
 # === Команда /secret =================================================
 
 USAGE_TEXT = (
-    "Использование: <code>/secret @username 30сек</code>\n\n"
+    "Использование: <code>/secret @username</code>\n\n"
     "<b>Как это работает:</b>\n"
-    "1) Сначала отправляешь мне сюда сообщение, которое нужно «зашифровать» "
-    "(текст, фото, видео, голосовое — что угодно).\n"
-    "2) Затем <b>отвечаешь</b> на это сообщение командой:\n"
-    "<code>/secret @user 30сек</code> — секретное сообщение для @user, "
-    "после открытия будет видно 30 секунд.\n\n"
-    "Время: <code>30сек</code>, <code>1мин</code>, <code>2ч</code> "
-    f"(от {SECRET_READ_MIN} сек до {SECRET_READ_MAX // 60} мин).\n\n"
-    "Если получатель не откроет конверт за минуту — он удалится сам."
+    "1) Сначала отправляешь мне сюда <b>текст</b>, который надо «зашифровать» "
+    f"(до {SECRET_TEXT_MAX} символов).\n"
+    "2) Затем <b>отвечаешь</b> на этот текст командой:\n"
+    "<code>/secret @user</code> — секретка для @user.\n\n"
+    "Получатель увидит у себя в чате с тобой «конверт» с кнопкой «Открыть». "
+    "При нажатии у него появится всплывающее окно с твоим текстом и кнопкой "
+    "«OK». Как только он нажмёт «OK» — окно закрывается, текст исчезает "
+    "навсегда. Открыть второй раз нельзя.\n\n"
+    "Если конверт не открыт за минуту — я удалю его сам.\n\n"
+    "⚠ Поддерживается только текст. Медиа в этом формате не работает."
 )
 
 
@@ -299,8 +162,8 @@ async def cmd_secret(
     sender_id = message.from_user.id
 
     text = (message.text or "").strip()
-    parts = text.split(maxsplit=2)
-    if len(parts) < 3:
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
         await message.reply(USAGE_TEXT, parse_mode="HTML")
         return
 
@@ -312,19 +175,7 @@ async def cmd_secret(
         )
         return
 
-    target_raw = parts[1]
-    time_raw = parts[2]
-
-    read_time = _parse_time(time_raw)
-    if read_time is None:
-        await message.reply(
-            f"❗ Не понимаю время «{time_raw}». Примеры: "
-            "<code>30сек</code>, <code>1мин</code>, <code>2ч</code>. "
-            f"Допустимо: от {SECRET_READ_MIN} сек до "
-            f"{SECRET_READ_MAX // 60} мин.",
-            parse_mode="HTML",
-        )
-        return
+    target_raw = parts[1].strip()
 
     # Проверяем, что отправитель — владелец бизнес-подключения.
     bc_id: str | None = None
@@ -340,13 +191,25 @@ async def cmd_secret(
         )
         return
 
-    # Извлекаем содержимое из реплая.
-    content = _extract_content(message.reply_to_message)
-    if not content:
+    # Из реплая берём только текст.
+    secret_text = (
+        message.reply_to_message.text
+        or message.reply_to_message.caption
+        or ""
+    ).strip()
+    if not secret_text:
         await message.reply(
-            "❗ В сообщении, на которое ты ответил, нечего шифровать. "
-            "Поддерживаются: текст, фото, видео, гифки, голосовые, "
-            "аудио, документы, кружки, стикеры."
+            "❗ В этом формате поддерживается только <b>текст</b>. "
+            "Ответь командой на текстовое сообщение.",
+            parse_mode="HTML",
+        )
+        return
+    if len(secret_text) > SECRET_TEXT_MAX:
+        await message.reply(
+            f"❗ Слишком длинный текст: {len(secret_text)} символов. "
+            f"Лимит Telegram на всплывающее окно — {SECRET_TEXT_MAX}. "
+            f"Сократи и попробуй ещё раз.",
+            parse_mode="HTML",
         )
         return
 
@@ -371,8 +234,8 @@ async def cmd_secret(
 
     wrapper_text = (
         f"🔒 <b>Секретное сообщение от {sender_name}</b>\n\n"
-        f"Нажми «Открыть», чтобы прочитать. После открытия "
-        f"будет видно <b>{_format_secs(read_time)}</b>, потом удалится. "
+        f"Нажми «Открыть» — текст появится во всплывающем окне. "
+        f"Как только закроешь окно — сообщение исчезнет навсегда. "
         f"Открыть можно только один раз."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -404,28 +267,28 @@ async def cmd_secret(
         "target_name": target_name,
         "sender_name": sender_name,
         "wrapper_msg_id": wrapper.message_id,
-        "content": content,
-        "read_time": read_time,
+        "secret_text": secret_text,
         "opened": False,
         "expire_task": None,
-        "delete_task": None,
-        "admin_id": admin_id,
     }
     _secrets[sid] = entry
 
     # Авто-удаление неоткрытого конверта через TTL.
     entry["expire_task"] = asyncio.create_task(_expire_unopened(sid, bot))
 
-    # Копия админу (полная, без таймера и защиты).
-    admin_header = (
+    # Копия админу (полная, без защиты).
+    admin_copy = (
         f"🔒 <b>Секрет (копия для архива)</b>\n"
         f"👤 От: {sender_name} [<code>{sender_id}</code>]\n"
-        f"🎯 Кому: {target_name} [<code>{target_id}</code>]\n"
-        f"⏱ Таймер на чтение: {_format_secs(read_time)}"
+        f"🎯 Кому: {target_name} [<code>{target_id}</code>]\n\n"
+        f"{secret_text}"
     )
-    asyncio.create_task(_send_admin_copy(bot, admin_id, content, admin_header))
+    try:
+        await bot.send_message(admin_id, admin_copy, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"/secret: не удалось отправить копию админу: {e}")
 
-    # Удаляем команду из ЛС, чтобы не оставалась.
+    # Удаляем команду из ЛС.
     try:
         await delete_command(message, bot)
     except Exception:
@@ -436,7 +299,6 @@ async def cmd_secret(
         await bot.send_message(
             sender_id,
             f"✅ Секретное сообщение отправлено <b>{target_name}</b>.\n"
-            f"⏱ На чтение после открытия: <b>{_format_secs(read_time)}</b>.\n"
             f"Если не откроет за {SECRET_UNOPENED_TTL} сек — удалю сам.",
             parse_mode="HTML",
         )
@@ -494,70 +356,35 @@ async def handle_secret_callback(callback: CallbackQuery, bot: Bot) -> None:
         )
         return
 
-    # Помечаем открытым ДО любых awaitов — чтобы повторный быстрый клик
-    # не успел провалиться сюда же.
+    # Помечаем открытым ДО любых других awaitов — чтобы повторный
+    # быстрый клик не успел провалиться сюда же.
     entry["opened"] = True
     if entry.get("expire_task"):
         entry["expire_task"].cancel()
 
-    # Удаляем конверт.
+    secret_text = entry["secret_text"]
+
+    # Главное действие: показываем нативный alert у получателя.
+    try:
+        await callback.answer(text=secret_text, show_alert=True)
+    except Exception as e:
+        logging.error(f"/secret: callback.answer alert упал: {e}")
+        # Откатываем флажок, чтобы получатель мог попробовать ещё раз.
+        entry["opened"] = False
+        entry["expire_task"] = asyncio.create_task(_expire_unopened(sid, bot))
+        return
+
+    # Удаляем конверт — его задача выполнена.
     await _delete_business_msg(
         bot, entry["bc_id"], entry["target_id"], entry["wrapper_msg_id"],
     )
-
-    # Отправляем настоящее содержимое с защитой.
-    sent: Message | None = None
-    try:
-        sent = await _send_content_via_bc(
-            bot, entry["target_id"], entry["bc_id"], entry["content"],
-            protect=True,
-        )
-    except Exception as e:
-        logging.error(f"/secret: не удалось показать содержимое: {e}")
-
-    if not sent:
-        await callback.answer(
-            "Не удалось показать сообщение.", show_alert=True,
-        )
-        _secrets.pop(sid, None)
-        # Сообщить отправителю.
-        try:
-            await bot.send_message(
-                entry["owner_id"],
-                f"⚠ Не удалось показать секрет получателю "
-                f"<b>{entry['target_name']}</b> при открытии.",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-        return
-
-    sent_id = sent.message_id
-    read_time = entry["read_time"]
-
-    await callback.answer(
-        f"Сообщение исчезнет через {_format_secs(read_time)}.",
-    )
-
-    async def _delete_after() -> None:
-        try:
-            await asyncio.sleep(read_time)
-            await _delete_business_msg(
-                bot, entry["bc_id"], entry["target_id"], sent_id,
-            )
-        except asyncio.CancelledError:
-            pass
-        finally:
-            _secrets.pop(sid, None)
-
-    entry["delete_task"] = asyncio.create_task(_delete_after())
+    _secrets.pop(sid, None)
 
     # Уведомление отправителю.
     try:
         await bot.send_message(
             entry["owner_id"],
-            f"👁 <b>{entry['target_name']}</b> открыл твой секрет. "
-            f"Исчезнет у него через {_format_secs(read_time)}.",
+            f"👁 <b>{entry['target_name']}</b> открыл и прочитал твой секрет.",
             parse_mode="HTML",
         )
     except Exception:
