@@ -27,6 +27,7 @@ from quran import (
     _find_reciter_by_alias,
 )
 from animations import cmd_love
+from secret import cmd_secret, handle_secret_callback
 
 logging.basicConfig(level=logging.INFO)
 
@@ -1216,6 +1217,22 @@ async def handle_reciters_list_pm(message: Message):
     if message.from_user and message.from_user.id in banned_users:
         return
     await cmd_reciters_list(message, bot)
+
+
+@dp.message(F.chat.type == "private", Command("secret"))
+async def handle_secret_pm(message: Message):
+    """/secret — отправка одноразового сообщения через бизнес-подключение
+    отправителя. Сама логика — в модуле secret.py. Здесь только тонкая
+    обёртка, которая прокидывает зависимости (admin_id и словари состояния)."""
+    if message.from_user and message.from_user.id in banned_users:
+        return
+    await cmd_secret(message, bot, ADMIN_ID, connection_owners, connected_users)
+
+
+@dp.callback_query(F.data.startswith("secret:"))
+async def handle_secret_cb(callback):
+    """Callback на кнопку «Открыть» в секретном конверте."""
+    await handle_secret_callback(callback, bot)
 
 
 # Универсальный PM-хендлер: разбирает «обычный» текст без слэша.
