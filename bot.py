@@ -18,6 +18,7 @@ from cmds import (
 )
 from quote import cmd_quote
 from search import cmd_search
+from groq import cmd_groq
 from voice import cmd_voice, cmd_audio
 from music import cmd_music
 from quran import (
@@ -362,7 +363,7 @@ custom_aliases: dict[str, str] = {}
 # Канонические команды, на которые ВООБЩЕ можно вешать синоним.
 # Защищает от опечаток вроде "/alias add .x liike".
 _ALIAS_TARGETS = frozenset({
-    "spam", "stop", "like", "nolike", "save", "id", "q", "search",
+    "spam", "stop", "like", "nolike", "save", "id", "q", "search", "groq",
     "mute", "unmute", "mirror", "typing", "ignore", "troll",
     "voice", "audio", "music", "quran", "love",
 })
@@ -750,7 +751,7 @@ async def handle_business_message(message: Message):
             cmd = "q"
     is_known_cmd = cmd in (
         "spam", "stop", "like", "nolike", "save",
-        "id", "q", "search", "mute", "unmute", "mirror",
+        "id", "q", "search", "groq", "mute", "unmute", "mirror",
         "typing", "ignore", "troll", "voice", "audio", "music",
         "quran", "love",
     )
@@ -888,6 +889,10 @@ async def handle_business_message(message: Message):
             # Запрос к AI может занимать несколько секунд — в фон,
             # чтобы Telegram не передоставил апдейт.
             asyncio.create_task(cmd_search(message, bot))
+        elif cmd == "groq":
+            # Аналог /search, но через Groq (llama-3.3-70b по умолчанию).
+            # Тоже в фон — сетевой запрос к API.
+            asyncio.create_task(cmd_groq(message, bot))
         elif cmd == "like":
             chat_id = message.chat.id
             try:
