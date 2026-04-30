@@ -173,7 +173,7 @@ def save_to_cache(message: Message):
 # ──────────── Персистентность кэша и состояния ────────────
 # Кэш в памяти теряется при рестарте контейнера. Сохраняем на диск,
 # чтобы /q N и форвард удалённых работали сразу после перезапуска.
-DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/save_mod_data"))
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 CACHE_FILE = DATA_DIR / "cache.jsonl"
 STATE_FILE = DATA_DIR / "state.json"
 
@@ -1512,6 +1512,94 @@ async def cmd_users(message: Message):
         uname = f" (@{info['username']})" if info.get("username") else ""
         lines.append(f"• {info['name']}{uname} — 🆔 {uid}{ban_mark}")
     await message.answer("\n".join(lines))
+
+
+@dp.message(Command("topics"))
+async def cmd_topics(message: Message):
+    """Показывает все привязки owner_id → message_thread_id в группе GROUP_ID."""
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    if not owner_topics:
+        await message.answer("📑 Нет ни одной привязанной темы.")
+        return
+    lines = [f"📑 Привязки тем в группе <code>{GROUP_ID}</code>:\n"]
+    for uid, tid in sorted(owner_topics.items()):
+        info = connected_users.get(uid)
+        if info:
+            uname = f" (@{info['username']})" if info.get("username") else ""
+            label = f"{info['name']}{uname}"
+        else:
+            label = "—"
+        lines.append(f"• {label} — owner=<code>{uid}</code> → topic=<code>{tid}</code>")
+    lines.append(
+        "\nПривязать существующую тему:  <code>/relink owner_id thread_id</code>"
+        "\nУдалить (создастся новая):    <code>/unlink owner_id</code>"
+    )
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("relink"))
+async def cmd_relink(message: Message):
+    """/relink <owner_id> <thread_id> — вручную связать владельца с уже
+    существующей темой. Пригодится, когда после рестарта контейнера
+    state.json потерян и бот начал создавать дубликаты."""
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 3:
+        await message.answer(
+            "Использование: <code>/relink owner_id thread_id</code>",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        owner_id = int(parts[1])
+        thread_id = int(parts[2])
+    except ValueError:
+        await message.answer("owner_id и thread_id должны быть числами.")
+        return
+    old = owner_topics.get(owner_id)
+    owner_topics[owner_id] = thread_id
+    schedule_persist()
+    if old is not None and old != thread_id:
+        await message.answer(
+            f"🔁 owner=<code>{owner_id}</code>: тема <code>{old}</code> → <code>{thread_id}</code>",
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(
+            f"✅ owner=<code>{owner_id}</code> привязан к теме <code>{thread_id}</code>",
+            parse_mode="HTML",
+        )
+
+
+@dp.message(Command("unlink"))
+async def cmd_unlink(message: Message):
+    """/unlink <owner_id> — забыть привязку. Следующее сообщение от владельца
+    создаст НОВУЮ тему. Старая тема в группе при этом не удаляется."""
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        await message.answer(
+            "Использование: <code>/unlink owner_id</code>",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        owner_id = int(parts[1])
+    except ValueError:
+        await message.answer("owner_id должен быть числом.")
+        return
+    old = owner_topics.pop(owner_id, None)
+    if old is None:
+        await message.answer(f"У owner=<code>{owner_id}</code> и так нет привязки.", parse_mode="HTML")
+        return
+    schedule_persist()
+    await message.answer(
+        f"🗑 Привязка owner=<code>{owner_id}</code> → topic=<code>{old}</code> удалена.",
+        parse_mode="HTML",
+    )
 
 
 @dp.message(Command("stats"))
