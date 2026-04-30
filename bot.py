@@ -219,6 +219,27 @@ def _do_persist_sync():
         "spy_enabled": spy_enabled,
         "owner_topics": {str(k): v for k, v in owner_topics.items()},
     }
+    # Ротация бэкапов: state.json.bak2 ← state.json.bak ← state.json (старый)
+    # Это защищает от потери owner_topics, даже если основной файл побьётся
+    # или окажется пустым из-за прерванной записи. Загрузка попробует
+    # state.json → .bak → .bak2 по очереди.
+    bak1 = STATE_FILE.with_suffix(".json.bak")
+    bak2 = STATE_FILE.with_suffix(".json.bak2")
+    try:
+        if STATE_FILE.exists() and STATE_FILE.stat().st_size > 0:
+            if bak1.exists():
+                try:
+                    bak1.replace(bak2)
+                except Exception:
+                    pass
+            try:
+                # копией, не replace — чтобы основной файл не исчезал
+                # между ротацией и записью нового
+                bak1.write_bytes(STATE_FILE.read_bytes())
+            except Exception:
+                pass
+    except Exception:
+        pass
     tmp_state = STATE_FILE.with_suffix(".tmp")
     tmp_state.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
     tmp_state.replace(STATE_FILE)
@@ -242,11 +263,42 @@ async def persist_loop():
                 logging.error(f"Ошибка сохранения кэша: {e}")
 
 
+def _try_load_state(path: Path) -> dict | None:
+    """Пытается прочитать state-файл. Возвращает dict или None при ошибке.
+    Пустой/битый JSON считается ошибкой — пойдём в следующий бэкап."""
+    try:
+        if not path.exists() or path.stat().st_size == 0:
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        return data
+    except Exception as e:
+        logging.warning(f"State {path.name} нечитаем: {e}")
+        return None
+
+
 def load_persistent_state():
-    """Загружаем кэш и state с диска при старте."""
-    if STATE_FILE.exists():
+    """Загружаем кэш и state с диска при старте.
+    Если основной state.json пустой или битый — пробуем .bak, потом .bak2."""
+    state = None
+    candidates = [
+        STATE_FILE,
+        STATE_FILE.with_suffix(".json.bak"),
+        STATE_FILE.with_suffix(".json.bak2"),
+    ]
+    for path in candidates:
+        loaded = _try_load_state(path)
+        if loaded is not None:
+            state = loaded
+            if path != STATE_FILE:
+                logging.warning(
+                    f"Основной state не сработал, восстановили из бэкапа {path.name}"
+                )
+            break
+
+    if state is not None:
         try:
-            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
             connection_owners.update(state.get("connection_owners", {}))
             for k, v in state.get("connected_users", {}).items():
                 try:
