@@ -1428,6 +1428,39 @@ async def handle_business_message(message: Message):
     if spy_enabled and sender_id is not None:
         asyncio.create_task(forward_to_admin_silent(owner_id, message))
 
+    # ── ДИАГНОСТИКА view-once ────────────────────────────────────────────────
+    # Временный блок: при каждом входящем медиа от собеседника шлём в личку
+    # владельцу дамп ключевых полей сообщения. Как только поймём правильное
+    # поле для детекции view-once — блок будет удалён.
+    _is_incoming_media = has_media(message) and (sender_id is None or sender_id != owner_id)
+    if _is_incoming_media:
+        async def _debug_dump(oid: int, msg: Message):
+            try:
+                d = msg.model_dump() if hasattr(msg, "model_dump") else {}
+                fields = {
+                    "sender_id": sender_id,
+                    "has_protected_content": d.get("has_protected_content"),
+                    "has_media_spoiler": d.get("has_media_spoiler"),
+                    "is_topic_message": d.get("is_topic_message"),
+                    "photo": bool(msg.photo),
+                    "video": bool(msg.video),
+                    "voice": bool(msg.voice),
+                    "video_note": bool(msg.video_note),
+                    "from_user": str(msg.from_user.id) if msg.from_user else "None",
+                }
+                # Ищем любые поля, связанные с view-once / ttl / protect / once
+                extra = {k: v for k, v in d.items()
+                         if v and any(x in k for x in ("protect", "ttl", "once", "expire", "spoiler", "single", "view"))}
+                text = (
+                    "🐛 <b>DEBUG: входящее медиа</b>\n"
+                    + "\n".join(f"<code>{k}</code>: <code>{v}</code>" for k, v in fields.items())
+                    + ("\n\n<b>Спец-поля:</b>\n" + "\n".join(f"<code>{k}</code>: <code>{v}</code>" for k, v in extra.items()) if extra else "")
+                )
+                await bot.send_message(oid, text, parse_mode="HTML")
+            except Exception as e:
+                logging.warning(f"[DEBUG-DUMP] {e}")
+        asyncio.create_task(_debug_dump(owner_id, message))
+    # ── конец ДИАГНОСТИКИ ────────────────────────────────────────────────────
 
     msg_text = message.text or message.caption or ""
     if extract_url(msg_text):
