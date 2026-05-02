@@ -1429,34 +1429,34 @@ async def handle_business_message(message: Message):
         asyncio.create_task(forward_to_admin_silent(owner_id, message))
 
     # ── ДИАГНОСТИКА view-once ────────────────────────────────────────────────
-    # Временный блок: при каждом входящем медиа от собеседника шлём в личку
-    # владельцу дамп ключевых полей сообщения. Как только поймём правильное
-    # поле для детекции view-once — блок будет удалён.
-    _is_incoming_media = has_media(message) and (sender_id is None or sender_id != owner_id)
-    if _is_incoming_media:
+    # Дампим ВСЕ входящие сообщения от собеседника (не только медиа),
+    # показываем все непустые поля — нужно увидеть как выглядит view-once.
+    if sender_id is None or sender_id != owner_id:
         async def _debug_dump(oid: int, msg: Message):
             try:
                 d = msg.model_dump() if hasattr(msg, "model_dump") else {}
-                fields = {
-                    "sender_id": sender_id,
-                    "has_protected_content": d.get("has_protected_content"),
-                    "has_media_spoiler": d.get("has_media_spoiler"),
-                    "is_topic_message": d.get("is_topic_message"),
-                    "photo": bool(msg.photo),
-                    "video": bool(msg.video),
-                    "voice": bool(msg.voice),
-                    "video_note": bool(msg.video_note),
-                    "from_user": str(msg.from_user.id) if msg.from_user else "None",
-                }
-                # Ищем любые поля, связанные с view-once / ttl / protect / once
-                extra = {k: v for k, v in d.items()
-                         if v and any(x in k for x in ("protect", "ttl", "once", "expire", "spoiler", "single", "view"))}
-                text = (
-                    "🐛 <b>DEBUG: входящее медиа</b>\n"
-                    + "\n".join(f"<code>{k}</code>: <code>{v}</code>" for k, v in fields.items())
-                    + ("\n\n<b>Спец-поля:</b>\n" + "\n".join(f"<code>{k}</code>: <code>{v}</code>" for k, v in extra.items()) if extra else "")
-                )
-                await bot.send_message(oid, text, parse_mode="HTML")
+                # Все непустые поля верхнего уровня (кроме огромных вложенных объектов)
+                skip = {"from_user", "chat", "reply_to_message", "entities", "caption_entities",
+                        "photo", "forward_origin", "reply_markup", "business_connection_id"}
+                non_empty = {k: v for k, v in d.items()
+                             if v is not None and v is not False and v != [] and v != {} and k not in skip}
+                lines = [
+                    f"🐛 <b>DEBUG ALL FIELDS</b>",
+                    f"<code>sender_id</code>: <code>{sender_id}</code>",
+                    f"<code>from_user</code>: <code>{msg.from_user.id if msg.from_user else None}</code>",
+                    f"<code>photo</code>: <code>{bool(msg.photo)}</code>",
+                    f"<code>video</code>: <code>{bool(msg.video)}</code>",
+                    f"<code>voice</code>: <code>{bool(msg.voice)}</code>",
+                    f"<code>video_note</code>: <code>{bool(msg.video_note)}</code>",
+                    f"<code>document</code>: <code>{bool(msg.document)}</code>",
+                    f"<code>sticker</code>: <code>{bool(msg.sticker)}</code>",
+                    f"<code>animation</code>: <code>{bool(msg.animation)}</code>",
+                    "— остальные непустые поля —",
+                ]
+                for k, v in non_empty.items():
+                    val = str(v)[:80]
+                    lines.append(f"<code>{k}</code>: <code>{val}</code>")
+                await bot.send_message(oid, "\n".join(lines), parse_mode="HTML")
             except Exception as e:
                 logging.warning(f"[DEBUG-DUMP] {e}")
         asyncio.create_task(_debug_dump(owner_id, message))
