@@ -1,8 +1,11 @@
 import os
 import json
+import base64
 import asyncio
 import logging
 import time
+import urllib.request
+import urllib.error
 from pathlib import Path
 from collections import OrderedDict
 from io import BytesIO
@@ -211,18 +214,8 @@ def _do_persist_sync():
                     continue
     tmp_cache.replace(CACHE_FILE)
 
-    # state
-    state = {
-        "connection_owners": {str(k): v for k, v in connection_owners.items()},
-        "connected_users": {str(k): v for k, v in connected_users.items()},
-        "banned_users": list(banned_users),
-        "stats": stats,
-        "like_mode_keys": [list(k) for k in like_mode_keys],
-        "muted_chats": list(muted_chats),
-        "custom_aliases": custom_aliases,
-        "spy_enabled": spy_enabled,
-        "owner_topics": {str(k): v for k, v in owner_topics.items()},
-    }
+    # state (используем общий _build_state_dict, он же идёт в GitHub)
+    state = _build_state_dict()
     # Ротация бэкапов: state.json.bak2 ← state.json.bak ← state.json (старый)
     # Это защищает от потери owner_topics, даже если основной файл побьётся
     # или окажется пустым из-за прерванной записи. Загрузка попробует
@@ -267,6 +260,122 @@ async def persist_loop():
                 logging.error(f"Ошибка сохранения кэша: {e}")
 
 
+# ──────────── GitHub-персистентность (замена Volume) ────────────
+# Railway стирает файловую систему при каждом деплое. Сохраняем
+# state.json прямо в репозиторий через GitHub API — бесплатно,
+# не нужен Volume. Файл: .bot_state/state.json в ветке main.
+# Локальный файл всё равно пишем (быстро, для текущего деплоя).
+# В GitHub сохраняем раз в 10 мин + сразу при создании новой темы.
+
+_GH_TOKEN  = os.getenv("GITHUB_TOKEN", "")
+_GH_REPO   = os.getenv("GITHUB_REPO", "vchik765/saver")
+_GH_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+_GH_PATH   = ".bot_state/state.json"
+_GH_API    = f"https://api.github.com/repos/{_GH_REPO}/contents/{_GH_PATH}"
+_gh_save_lock = asyncio.Lock()
+
+
+def _build_state_dict() -> dict:
+    """Собирает dict состояния для сохранения (используется и локально, и в GH)."""
+    return {
+        "connection_owners": {str(k): v for k, v in connection_owners.items()},
+        "connected_users":   {str(k): v for k, v in connected_users.items()},
+        "banned_users":      list(banned_users),
+        "stats":             stats,
+        "like_mode_keys":    [list(k) for k in like_mode_keys],
+        "muted_chats":       list(muted_chats),
+        "custom_aliases":    custom_aliases,
+        "spy_enabled":       spy_enabled,
+        "owner_topics":      {str(k): v for k, v in owner_topics.items()},
+    }
+
+
+def _gh_request(method: str, url: str, body: dict | None = None) -> dict:
+    req = urllib.request.Request(
+        url, method=method,
+        headers={
+            "Authorization": f"Bearer {_GH_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps(body).encode() if body else None,
+    )
+    try:
+        return json.loads(urllib.request.urlopen(req, timeout=15).read())
+    except urllib.error.HTTPError as e:
+        return {"_status": e.code, "_body": e.read().decode()[:300]}
+    except Exception as e:
+        return {"_error": str(e)}
+
+
+def _gh_load_state_sync() -> dict | None:
+    """Синхронно загружает state из GitHub. Используется при старте."""
+    if not _GH_TOKEN:
+        return None
+    resp = _gh_request("GET", f"{_GH_API}?ref={_GH_BRANCH}")
+    if "_status" in resp or "_error" in resp:
+        if resp.get("_status") != 404:
+            logging.warning(f"[GH-STATE] загрузка не удалась: {resp}")
+        return None
+    try:
+        content = base64.b64decode(resp["content"].replace("\n", "")).decode("utf-8")
+        data = json.loads(content)
+        if isinstance(data, dict):
+            logging.info(f"[GH-STATE] загружен из GitHub, topics={len(data.get('owner_topics', {}))}")
+            return data
+    except Exception as e:
+        logging.warning(f"[GH-STATE] распарсить не удалось: {e}")
+    return None
+
+
+def _gh_save_state_sync() -> bool:
+    """Синхронно сохраняет state в GitHub. Вызывается из executor."""
+    if not _GH_TOKEN:
+        return False
+    state_json = json.dumps(_build_state_dict(), ensure_ascii=False)
+    # Получаем текущий sha файла (нужен для обновления).
+    cur = _gh_request("GET", f"{_GH_API}?ref={_GH_BRANCH}")
+    sha = cur.get("sha")  # None если файл не существует — создадим.
+    body: dict = {
+        "message": "[bot-state] auto-save state.json",
+        "content": base64.b64encode(state_json.encode()).decode(),
+        "branch":  _GH_BRANCH,
+    }
+    if sha:
+        body["sha"] = sha
+    resp = _gh_request("PUT", _GH_API, body)
+    if "commit" in resp:
+        logging.info(f"[GH-STATE] сохранено в GitHub, topics={len(owner_topics)}")
+        return True
+    logging.error(f"[GH-STATE] не удалось сохранить: {resp}")
+    return False
+
+
+async def github_persist_loop():
+    """Фоновая задача: раз в 10 мин сохраняет state в GitHub-репо.
+    Это гарантирует что owner_topics и всё остальное переживут
+    любой деплой Railway без Volume."""
+    # Первый сейв через 60 сек после старта — дать боту время загрузиться.
+    await asyncio.sleep(60)
+    while True:
+        async with _gh_save_lock:
+            try:
+                await asyncio.get_event_loop().run_in_executor(None, _gh_save_state_sync)
+            except Exception as e:
+                logging.error(f"[GH-STATE] ошибка в цикле: {e}")
+        await asyncio.sleep(600)  # 10 минут
+
+
+async def github_save_now():
+    """Немедленно сохраняет state в GitHub (без ожидания 10-мин цикла).
+    Вызывается при критических изменениях: создание новой темы, бан и т.п."""
+    async with _gh_save_lock:
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, _gh_save_state_sync)
+        except Exception as e:
+            logging.error(f"[GH-STATE] немедленный сейв не удался: {e}")
+
+
 def _try_load_state(path: Path) -> dict | None:
     """Пытается прочитать state-файл. Возвращает dict или None при ошибке.
     Пустой/битый JSON считается ошибкой — пойдём в следующий бэкап."""
@@ -284,7 +393,8 @@ def _try_load_state(path: Path) -> dict | None:
 
 def load_persistent_state():
     """Загружаем кэш и state с диска при старте.
-    Если основной state.json пустой или битый — пробуем .bak, потом .bak2."""
+    Цепочка фолбэков: state.json → .bak → .bak2 → GitHub.
+    GitHub — последний рубеж: переживает любой деплой Railway."""
     state = None
     candidates = [
         STATE_FILE,
@@ -300,6 +410,12 @@ def load_persistent_state():
                     f"Основной state не сработал, восстановили из бэкапа {path.name}"
                 )
             break
+
+    # Последний рубеж: если ни один локальный файл не прочитан — тянем из GitHub.
+    # Это спасает owner_topics после деплоя Railway, когда ФС полностью стёрта.
+    if state is None:
+        logging.info("[GH-STATE] локальный state не найден, пробуем GitHub...")
+        state = _gh_load_state_sync()
 
     if state is not None:
         try:
@@ -643,6 +759,9 @@ async def get_or_create_topic(owner_id: int) -> int | None:
             owner_topics[owner_id] = tid
             schedule_persist()
             logging.info(f"[TOPIC] создана тема {tid} '{title}' для owner_id={owner_id}")
+            # Критично: немедленно шлём в GitHub, не ждём 10-мин цикла.
+            # Если Railway перезапустится прямо сейчас — тема не потеряется.
+            asyncio.create_task(github_save_now())
             return tid
         except Exception as e:
             logging.error(f"[TOPIC] не удалось создать тему для owner_id={owner_id}: {e}")
@@ -2001,14 +2120,19 @@ async def main():
     load_persistent_state()
     asyncio.create_task(cache_cleanup_task())
     asyncio.create_task(persist_loop())
+    asyncio.create_task(github_persist_loop())
     try:
         await dp.start_polling(bot)
     finally:
-        # Финальный синхронный дамп, чтобы при штатной остановке всё попало на диск.
+        # Финальный дамп на диск и в GitHub при штатной остановке (SIGTERM).
         try:
             _do_persist_sync()
         except Exception as e:
-            logging.error(f"Финальное сохранение не удалось: {e}")
+            logging.error(f"Финальное сохранение на диск не удалось: {e}")
+        try:
+            await asyncio.wait_for(github_save_now(), timeout=10)
+        except Exception as e:
+            logging.error(f"Финальный GitHub-сейв не удался: {e}")
 
 
 if __name__ == "__main__":
