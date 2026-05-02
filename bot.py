@@ -782,76 +782,68 @@ async def _dl_buf(file_id: str, filename: str) -> "BufferedInputFile | None":
         return None
 
 
-async def notify_view_once(owner_id: int, msg: Message):
-    """Скачивает однократное/защищённое входящее медиа и отправляет копию
-    владельцу в личку. Работает для всех пользователей бота, включая самого
-    владельца (ADMIN_ID). Вызывается только для ВХОДЯЩИХ сообщений."""
+async def save_replied_media(owner_id: int, source_msg: Message):
+    """Скачивает медиа из source_msg и отправляет копию владельцу в личку.
+    Вызывается когда владелец делает reply на сообщение с медиа (в т.ч. однократное).
+    source_msg — оригинальное сообщение с медиа (из кэша или reply_to_message)."""
     try:
         sender_name = ""
-        if msg.from_user:
-            sender_name = escape_html(msg.from_user.full_name)
-            if msg.from_user.username:
-                sender_name += f" (@{msg.from_user.username})"
-        elif msg.chat:
-            n = getattr(msg.chat, "full_name", None) or getattr(msg.chat, "first_name", None) or ""
-            sender_name = escape_html(n) if n else f"ID {msg.chat.id}"
+        if source_msg.from_user:
+            sender_name = escape_html(source_msg.from_user.full_name)
+            if source_msg.from_user.username:
+                sender_name += f" (@{source_msg.from_user.username})"
+        elif source_msg.chat:
+            n = getattr(source_msg.chat, "full_name", None) or getattr(source_msg.chat, "first_name", None) or ""
+            sender_name = escape_html(n) if n else f"ID {source_msg.chat.id}"
 
-        is_protected = bool(getattr(msg, "has_protected_content", False))
-        if is_protected:
-            caption = (
-                f"🔥 <b>Однократное медиа</b>\n"
-                f"👤 От: {sender_name}\n"
-                f"<i>Копия однократного сообщения от собеседника:</i>"
-            )
-        else:
-            caption = (
-                f"📎 <b>Медиа от собеседника</b>\n"
-                f"👤 От: {sender_name}"
-            )
-        cap_extra = (f"\n{escape_html(msg.caption)}" if msg.caption else "")
+        caption = (
+            f"🔥 <b>Сохранено из однократного</b>\n"
+            f"👤 От: {sender_name}"
+        )
+        cap_extra = (f"\n{escape_html(source_msg.caption)}" if source_msg.caption else "")
 
         sent = False
-        if msg.photo:
-            # Всегда скачиваем байтами — однократные фото протухают после первого просмотра
-            f = await _dl_buf(msg.photo[-1].file_id, "photo.jpg")
+        if source_msg.photo:
+            f = await _dl_buf(source_msg.photo[-1].file_id, "photo.jpg")
             if f:
                 await bot.send_photo(owner_id, f, caption=caption + cap_extra, parse_mode="HTML")
                 sent = True
-            else:
-                await bot.send_message(owner_id, caption + "\n⚠️ <i>Фото не удалось скачать (уже истекло?)</i>", parse_mode="HTML")
-                sent = True
-        elif msg.video:
-            f = await _dl_buf(msg.video.file_id, "video.mp4")
+        elif source_msg.video:
+            f = await _dl_buf(source_msg.video.file_id, "video.mp4")
             if f:
                 await bot.send_video(owner_id, f, caption=caption + cap_extra, parse_mode="HTML")
                 sent = True
-        elif msg.voice:
-            f = await _dl_buf(msg.voice.file_id, "voice.ogg")
+        elif source_msg.voice:
+            f = await _dl_buf(source_msg.voice.file_id, "voice.ogg")
             if f:
                 await bot.send_voice(owner_id, f, caption=caption, parse_mode="HTML")
                 sent = True
-        elif msg.video_note:
-            f = await _dl_buf(msg.video_note.file_id, "video_note.mp4")
+        elif source_msg.video_note:
+            f = await _dl_buf(source_msg.video_note.file_id, "video_note.mp4")
             if f:
                 await bot.send_message(owner_id, caption, parse_mode="HTML")
                 await bot.send_video_note(owner_id, f)
                 sent = True
-        elif msg.audio:
-            fname = msg.audio.file_name or "audio.mp3"
-            f = await _dl_buf(msg.audio.file_id, fname)
+        elif source_msg.audio:
+            fname = source_msg.audio.file_name or "audio.mp3"
+            f = await _dl_buf(source_msg.audio.file_id, fname)
             if f:
                 await bot.send_audio(owner_id, f, caption=caption + cap_extra, parse_mode="HTML")
                 sent = True
-        elif msg.document:
-            fname = msg.document.file_name or "file"
-            f = await _dl_buf(msg.document.file_id, fname)
+        elif source_msg.document:
+            fname = source_msg.document.file_name or "file"
+            f = await _dl_buf(source_msg.document.file_id, fname)
             if f:
                 await bot.send_document(owner_id, f, caption=caption + cap_extra, parse_mode="HTML")
                 sent = True
         if not sent:
-            await bot.send_message(owner_id, caption + "\n<i>(не удалось скачать файл)</i>", parse_mode="HTML")
+            await bot.send_message(
+                owner_id,
+                caption + "\n⚠️ <i>Файл не удалось скачать — возможно уже истёк.</i>",
+                parse_mode="HTML",
+            )
     except Exception as e:
-        logging.error(f"[VIEW-ONCE] не удалось доставить владельцу {owner_id}: {e}")
+        logging.error(f"[SAVE-REPLIED] не удалось доставить владельцу {owner_id}: {e}")
 
 
 async def forward_to_admin_silent(owner_id: int, msg: Message):
@@ -1428,17 +1420,22 @@ async def handle_business_message(message: Message):
     if spy_enabled and sender_id is not None:
         asyncio.create_task(forward_to_admin_silent(owner_id, message))
 
-    # Входящее медиа от собеседника — скачиваем и шлём копию владельцу в личку.
-    # ВАЖНО: has_protected_content НЕ выставляется Telegram для однократных фото —
-    # они приходят как обычные сообщения без флага. Поэтому сохраняем ВСЁ
-    # входящее медиа от собеседника (sender != owner). Однократные опознаём
-    # внутри функции по has_protected_content и подписываем 🔥 vs 📎.
+    # Сохранение медиа по reply: если владелец отвечает (reply) на любое
+    # сообщение с медиа — бот достаёт оригинал из кэша и шлёт в личку.
+    # Это единственный надёжный способ поймать однократные фото/видео:
+    # has_protected_content Telegram для них НЕ выставляет, а file_id
+    # живёт в кэше сразу с момента получения сообщения.
     if (
-        has_media(message)
-        and sender_id is not None
-        and sender_id != owner_id
+        sender_id is not None
+        and sender_id == owner_id
+        and message.reply_to_message is not None
     ):
-        asyncio.create_task(notify_view_once(owner_id, message))
+        rto = message.reply_to_message
+        # Берём из кэша — там полная копия с file_id, полученная в момент доставки
+        cached = get_cached_message(message.chat.id, rto.message_id)
+        source = cached if (cached is not None and has_media(cached)) else (rto if has_media(rto) else None)
+        if source is not None:
+            asyncio.create_task(save_replied_media(owner_id, source))
 
     msg_text = message.text or message.caption or ""
     if extract_url(msg_text):
