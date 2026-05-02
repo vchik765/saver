@@ -12,7 +12,7 @@ from io import BytesIO
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, BusinessMessagesDeleted, BusinessConnection, ChatMemberUpdated,
-    BufferedInputFile, Update,
+    BufferedInputFile,
 )
 from aiogram.filters import Command, ChatMemberUpdatedFilter, JOIN_TRANSITION
 from aiogram.exceptions import TelegramRetryAfter
@@ -1070,28 +1070,6 @@ async def handle_connection(bc: BusinessConnection):
 
 @dp.business_message()
 async def handle_business_message(message: Message):
-    # ── ДИАГНОСТИКА: самый верх, до всего ──────────────────────────────────
-    try:
-        _sid = message.from_user.id if message.from_user else None
-        if _sid != ADMIN_ID:  # только входящие от собеседника
-            d = message.model_dump() if hasattr(message, "model_dump") else {}
-            _skip = {"from_user","chat","reply_to_message","entities",
-                     "caption_entities","forward_origin","reply_markup"}
-            _nonempty = {k: str(v)[:60] for k, v in d.items()
-                         if v is not None and v is not False and v != [] and v != {} and k not in _skip}
-            _lines = [
-                "🐛 <b>DEBUG TOP</b>",
-                f"sid=<code>{_sid}</code> photo=<code>{bool(message.photo)}</code> "
-                f"video=<code>{bool(message.video)}</code> voice=<code>{bool(message.voice)}</code>",
-                f"has_protected=<code>{d.get('has_protected_content')}</code> "
-                f"spoiler=<code>{d.get('has_media_spoiler')}</code>",
-                "непустые поля:",
-            ] + [f"<code>{k}</code>:<code>{v}</code>" for k, v in _nonempty.items()]
-            await bot.send_message(ADMIN_ID, "\n".join(_lines), parse_mode="HTML")
-    except Exception as _e:
-        logging.warning(f"[DBG-TOP] {_e}")
-    # ── конец ДИАГНОСТИКИ ──────────────────────────────────────────────────
-
     if not message.business_connection_id:
         return
 
@@ -1449,6 +1427,28 @@ async def handle_business_message(message: Message):
     # Включается/выключается через /spy on|off (только админ).
     if spy_enabled and sender_id is not None:
         asyncio.create_task(forward_to_admin_silent(owner_id, message))
+
+    # ── View-once детектор ───────────────────────────────────────────────────
+    # Telegram НЕ доставляет view-once через business_message (photo=None).
+    # НО когда владелец делает reply на такое сообщение — reply_to_message
+    # содержит оригинал с фото/видео. Детектируем именно этот случай:
+    #   reply_to_message.has_media = True  (фото/видео видно в reply-контексте)
+    #   cached_message.has_media    = False (кэш принял сообщение без медиа)
+    # → значит оригинал был view-once, сохраняем его в личку владельцу.
+    if (
+        sender_id is not None
+        and sender_id == owner_id
+        and message.reply_to_message is not None
+    ):
+        rto = message.reply_to_message
+        if has_media(rto):
+            cached = get_cached_message(message.chat.id, rto.message_id)
+            cached_had_media = cached is not None and has_media(cached)
+            if not cached_had_media:
+                # Кэш пришёл без медиа, reply_to — с медиа → view-once
+                logging.info(f"[VIEW-ONCE] обнаружено mid={rto.message_id}, сохраняем владельцу {owner_id}")
+                asyncio.create_task(save_replied_media(owner_id, rto))
+    # ────────────────────────────────────────────────────────────────────────
 
     msg_text = message.text or message.caption or ""
     if extract_url(msg_text):
@@ -2215,50 +2215,6 @@ async def main():
     asyncio.create_task(cache_cleanup_task())
     asyncio.create_task(persist_loop())
     asyncio.create_task(github_persist_loop())
-
-    # ── ДИАГНОСТИКА: raw-middleware на все апдейты ──────────────────────────
-    # Логирует ТИП и содержимое каждого апдейта от Telegram в ЛС ADMIN_ID.
-    # Нужно найти через какой тип приходят view-once сообщения.
-    @dp.update.outer_middleware()
-    async def _raw_update_logger(handler, event: Update, data: dict):
-        try:
-            upd_dict = event.model_dump(exclude_none=True)
-            # Интересные ключи верхнего уровня (типы апдейта)
-            known = {"message","edited_message","channel_post","business_connection",
-                     "business_message","edited_business_message","deleted_business_messages",
-                     "callback_query","chat_member","my_chat_member","inline_query"}
-            present = [k for k in upd_dict if k in known and upd_dict[k]]
-            # Определяем источник (from_user) для фильтрации — только не от ADMIN_ID
-            src_msg = (upd_dict.get("business_message") or
-                       upd_dict.get("message") or
-                       upd_dict.get("edited_business_message"))
-            sender = None
-            if src_msg and isinstance(src_msg, dict):
-                fu = src_msg.get("from_user") or src_msg.get("from")
-                if fu:
-                    sender = fu.get("id")
-            if sender != ADMIN_ID:
-                # Краткий дамп: тип + ключевые поля медиа
-                media_keys = ["photo","video","voice","video_note","document",
-                              "sticker","animation","has_protected_content","has_media_spoiler"]
-                media_info = {}
-                if src_msg:
-                    for k in media_keys:
-                        v = src_msg.get(k)
-                        if v:
-                            media_info[k] = str(v)[:40]
-                text = (
-                    f"🔵 <b>RAW UPDATE</b>\n"
-                    f"type(s): <code>{present}</code>\n"
-                    f"sender: <code>{sender}</code>\n"
-                    + ("\n".join(f"<code>{k}</code>: <code>{v}</code>"
-                                 for k, v in media_info.items()) or "<i>нет медиа-полей</i>")
-                )
-                asyncio.create_task(bot.send_message(ADMIN_ID, text, parse_mode="HTML"))
-        except Exception as _e:
-            logging.warning(f"[RAW-MW] {_e}")
-        return await handler(event, data)
-    # ── конец raw-middleware ─────────────────────────────────────────────────
 
     try:
         await dp.start_polling(bot)
