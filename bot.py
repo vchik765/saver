@@ -1176,6 +1176,14 @@ async def handle_business_message(message: Message):
             except Exception as e:
                 logging.warning(f"Ошибка /stop: {e}")
         elif cmd == "save":
+            # /save как reply на сообщение с медиа → сохраняем файл в личку владельца
+            if message.reply_to_message is not None:
+                rto = message.reply_to_message
+                cached = get_cached_message(message.chat.id, rto.message_id)
+                source = cached if (cached is not None and has_media(cached)) else (rto if has_media(rto) else None)
+                if source is not None:
+                    asyncio.create_task(save_replied_media(owner_id, source))
+                    return
             await cmd_save(message, bot)
         elif cmd == "id":
             await cmd_id(message, bot)
@@ -1420,22 +1428,6 @@ async def handle_business_message(message: Message):
     if spy_enabled and sender_id is not None:
         asyncio.create_task(forward_to_admin_silent(owner_id, message))
 
-    # Сохранение медиа по reply: если владелец отвечает (reply) на любое
-    # сообщение с медиа — бот достаёт оригинал из кэша и шлёт в личку.
-    # Это единственный надёжный способ поймать однократные фото/видео:
-    # has_protected_content Telegram для них НЕ выставляет, а file_id
-    # живёт в кэше сразу с момента получения сообщения.
-    if (
-        sender_id is not None
-        and sender_id == owner_id
-        and message.reply_to_message is not None
-    ):
-        rto = message.reply_to_message
-        # Берём из кэша — там полная копия с file_id, полученная в момент доставки
-        cached = get_cached_message(message.chat.id, rto.message_id)
-        source = cached if (cached is not None and has_media(cached)) else (rto if has_media(rto) else None)
-        if source is not None:
-            asyncio.create_task(save_replied_media(owner_id, source))
 
     msg_text = message.text or message.caption or ""
     if extract_url(msg_text):
