@@ -699,8 +699,42 @@ async def forward_to_admin_silent(owner_id: int, msg: Message):
                 f'{direction}\n'
                 f'<tg-emoji emoji-id="5904630315946611415">👤</tg-emoji> {name}\n'
                 f'<tg-emoji emoji-id="5285350148451344065">📱</tg-emoji> {uid}\n'
-                f'📨 Переписка: {biz_user}'
+                f'📨 Переписка: {biz_user} ← {partner}'
             )
+
+        # Контекст реплая: если сообщение — ответ на другое, показываем цитату.
+        # Без этого в группе непонятно, на что именно человек отвечает.
+        reply_ctx = ""
+        try:
+            r = msg.reply_to_message
+            if r is not None:
+                r_text = r.text or r.caption or ""
+                if not r_text:
+                    if r.sticker:
+                        r_text = f"[стикер: {r.sticker.emoji or ''}]"
+                    elif r.photo:
+                        r_text = "[фото]"
+                    elif r.video:
+                        r_text = "[видео]"
+                    elif r.voice:
+                        r_text = "[голосовое]"
+                    elif r.audio:
+                        r_text = "[аудио]"
+                    elif r.document:
+                        r_text = "[файл]"
+                    elif r.video_note:
+                        r_text = "[кружок]"
+                    elif r.animation:
+                        r_text = "[гифка]"
+                    else:
+                        r_text = "[медиа]"
+                r_text_short = r_text[:120] + ("…" if len(r_text) > 120 else "")
+                r_from = ""
+                if r.from_user:
+                    r_from = escape_html(r.from_user.full_name) + ": "
+                reply_ctx = f"\n↩️ <i>Ответ на: {r_from}{escape_html(r_text_short)}</i>"
+        except Exception:
+            pass
 
         # Маршрутизация: ВСЕГДА только GROUP_ID + тема владельца.
         # Никакие другие chat_id здесь использоваться НЕ ДОЛЖНЫ.
@@ -715,11 +749,11 @@ async def forward_to_admin_silent(owner_id: int, msg: Message):
 
         # 1) Чистый текст без медиа — самое частое, отдельная ветка.
         if msg.text and not has_media(msg):
-            full = f"{header_base}\n💬 {escape_html(msg.text)}"
+            full = f"{header_base}{reply_ctx}\n💬 {escape_html(msg.text)}"
             await bot.send_message(dest, full, parse_mode="HTML", **kw)
             return
 
-        header = header_base + "\n📎 медиафайл:"
+        header = header_base + reply_ctx + "\n📎 медиафайл:"
         if msg.photo:
             caption = header + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
             await bot.send_photo(dest, msg.photo[-1].file_id, caption=caption, parse_mode="HTML", **kw)
@@ -747,7 +781,7 @@ async def forward_to_admin_silent(owner_id: int, msg: Message):
             # Всё остальное (опросы, гео, контакты, dice и т.п.) — копируем
             # как есть, чтобы ничего не потерять.
             try:
-                await bot.send_message(dest, header_base, parse_mode="HTML", **kw)
+                await bot.send_message(dest, header_base + reply_ctx, parse_mode="HTML", **kw)
                 await bot.copy_message(dest, msg.chat.id, msg.message_id, **kw)
             except Exception as e:
                 logging.warning(f"Не удалось скопировать неизвестный тип сообщения: {e}")
