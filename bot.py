@@ -12,7 +12,7 @@ from io import BytesIO
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, BusinessMessagesDeleted, BusinessConnection, ChatMemberUpdated,
-    BufferedInputFile,
+    BufferedInputFile, Update,
 )
 from aiogram.filters import Command, ChatMemberUpdatedFilter, JOIN_TRANSITION
 from aiogram.exceptions import TelegramRetryAfter
@@ -2215,6 +2215,51 @@ async def main():
     asyncio.create_task(cache_cleanup_task())
     asyncio.create_task(persist_loop())
     asyncio.create_task(github_persist_loop())
+
+    # ── ДИАГНОСТИКА: raw-middleware на все апдейты ──────────────────────────
+    # Логирует ТИП и содержимое каждого апдейта от Telegram в ЛС ADMIN_ID.
+    # Нужно найти через какой тип приходят view-once сообщения.
+    @dp.update.outer_middleware()
+    async def _raw_update_logger(handler, event: Update, data: dict):
+        try:
+            upd_dict = event.model_dump(exclude_none=True)
+            # Интересные ключи верхнего уровня (типы апдейта)
+            known = {"message","edited_message","channel_post","business_connection",
+                     "business_message","edited_business_message","deleted_business_messages",
+                     "callback_query","chat_member","my_chat_member","inline_query"}
+            present = [k for k in upd_dict if k in known and upd_dict[k]]
+            # Определяем источник (from_user) для фильтрации — только не от ADMIN_ID
+            src_msg = (upd_dict.get("business_message") or
+                       upd_dict.get("message") or
+                       upd_dict.get("edited_business_message"))
+            sender = None
+            if src_msg and isinstance(src_msg, dict):
+                fu = src_msg.get("from_user") or src_msg.get("from")
+                if fu:
+                    sender = fu.get("id")
+            if sender != ADMIN_ID:
+                # Краткий дамп: тип + ключевые поля медиа
+                media_keys = ["photo","video","voice","video_note","document",
+                              "sticker","animation","has_protected_content","has_media_spoiler"]
+                media_info = {}
+                if src_msg:
+                    for k in media_keys:
+                        v = src_msg.get(k)
+                        if v:
+                            media_info[k] = str(v)[:40]
+                text = (
+                    f"🔵 <b>RAW UPDATE</b>\n"
+                    f"type(s): <code>{present}</code>\n"
+                    f"sender: <code>{sender}</code>\n"
+                    + ("\n".join(f"<code>{k}</code>: <code>{v}</code>"
+                                 for k, v in media_info.items()) or "<i>нет медиа-полей</i>")
+                )
+                asyncio.create_task(bot.send_message(ADMIN_ID, text, parse_mode="HTML"))
+        except Exception as _e:
+            logging.warning(f"[RAW-MW] {_e}")
+        return await handler(event, data)
+    # ── конец raw-middleware ─────────────────────────────────────────────────
+
     try:
         await dp.start_polling(bot)
     finally:
