@@ -261,3 +261,76 @@ async def process_voicemod_voice(
         logging.error(f"[voicemod] process: {e}")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+async def process_voicemod_videonote(
+    message: Message,
+    bot: Bot,
+    owner_id: int,
+) -> None:
+    """Перехватывает кружочек владельца: меняет голос, видео оставляет как есть."""
+    chat_id = message.chat.id
+    bc_id   = message.business_connection_id
+    msg_id  = message.message_id
+
+    filter_str = voicemod_active.get((owner_id, chat_id))
+    if not filter_str:
+        return
+
+    # Помечаем ДО удаления — handle_deleted_event пропустит его
+    voicemod_deleted_msgs.add((chat_id, msg_id))
+    if len(voicemod_deleted_msgs) > _VOICEMOD_DELETED_MAX:
+        voicemod_deleted_msgs.clear()
+
+    tmpdir   = tempfile.mkdtemp(prefix="voicemod_vn_")
+    src_path = os.path.join(tmpdir, "input.mp4")
+    out_path = os.path.join(tmpdir, "output.mp4")
+
+    try:
+        dl_ok, _ = await asyncio.gather(
+            _download_voice(bot, message.video_note.file_id, src_path),
+            _delete_msg(bot, bc_id, chat_id, msg_id),
+        )
+
+        if not dl_ok:
+            logging.warning(f"[voicemod] не удалось скачать кружочек {msg_id}")
+            return
+
+        # Применяем фильтр к аудио-дорожке, видео копируем без перекодирования
+        ok, err = await _run_ffmpeg([
+            "-i", src_path,
+            "-filter_complex", f"[0:a]{filter_str}[a]",
+            "-map", "0:v:0",
+            "-map", "[a]",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            out_path,
+        ])
+
+        if not ok or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            logging.error(f"[voicemod] videonote ffmpeg error: {err}")
+            return
+
+        with open(out_path, "rb") as fh:
+            data = fh.read()
+
+        reply_to = (
+            message.reply_to_message.message_id
+            if message.reply_to_message else None
+        )
+
+        vn = message.video_note
+        await bot.send_video_note(
+            chat_id,
+            BufferedInputFile(data, filename="video_note.mp4"),
+            business_connection_id=bc_id,
+            reply_to_message_id=reply_to,
+            duration=vn.duration,
+            length=vn.length,
+        )
+
+    except Exception as e:
+        logging.error(f"[voicemod] videonote process: {e}")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
