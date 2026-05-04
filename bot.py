@@ -35,7 +35,7 @@ from quran import (
     _find_reciter_by_alias,
 )
 from animations import cmd_love
-from voicemod import cmd_voicemod, process_voicemod_voice, voicemod_active, voicemod_deleted_msgs
+from voicemod import cmd_voicemod, process_voicemod_voice, process_voicemod_videonote, voicemod_active, voicemod_deleted_msgs
 from secret import cmd_secret, handle_secret_callback
 
 logging.basicConfig(level=logging.INFO)
@@ -1510,16 +1510,19 @@ async def handle_business_message(message: Message):
         except Exception as e:
             logging.warning(f"[IGNORE] read_business_message: {e}")
 
-    # VoiceMod: перехватываем голосовые сообщения владельца.
+    # VoiceMod: перехватываем голосовые и кружочки владельца.
     # Делаем ДО mirror/like/url, чтобы гарантировать обработку.
     if (
         sender_id is not None
         and sender_id == owner_id
-        and message.voice is not None
         and (owner_id, message.chat.id) in voicemod_active
     ):
-        asyncio.create_task(process_voicemod_voice(message, bot, owner_id))
-        return
+        if message.voice is not None:
+            asyncio.create_task(process_voicemod_voice(message, bot, owner_id))
+            return
+        if message.video_note is not None:
+            asyncio.create_task(process_voicemod_videonote(message, bot, owner_id))
+            return
 
     # Режим /mirror: повторяем сообщение собеседника от имени владельца.
     # Поддерживаем текст и все типы медиа.
