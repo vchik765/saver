@@ -35,6 +35,7 @@ from quran import (
     _find_reciter_by_alias,
 )
 from animations import cmd_love
+from voicemod import cmd_voicemod, process_voicemod_voice, voicemod_active, voicemod_deleted_msgs
 from secret import cmd_secret, handle_secret_callback
 
 logging.basicConfig(level=logging.INFO)
@@ -540,6 +541,7 @@ DOT_ALIASES: dict[str, str] = {
     ".сура": "quran",
     ".аят": "quran",
     ".love": "love",
+    ".войсмод": "voicemod",
 }
 
 # Пользовательские синонимы, которые админ добавляет через /alias.
@@ -551,7 +553,7 @@ custom_aliases: dict[str, str] = {}
 _ALIAS_TARGETS = frozenset({
     "spam", "stop", "like", "nolike", "save", "id", "q", "search", "groq",
     "mute", "unmute", "mirror", "typing", "ignore", "troll",
-    "voice", "audio", "music", "quran", "love",
+    "voice", "audio", "music", "quran", "love", "voicemod",
 })
 
 
@@ -1207,7 +1209,7 @@ async def handle_business_message(message: Message):
         "spam", "stop", "like", "nolike", "save",
         "id", "q", "search", "groq", "mute", "unmute", "mirror",
         "typing", "ignore", "troll", "voice", "audio", "music",
-        "quran", "love",
+        "quran", "love", "voicemod",
     )
 
     # КРИТИЧНО: кэшируем максимально рано, ДО любых await,
@@ -1249,6 +1251,7 @@ async def handle_business_message(message: Message):
             # любого await, чтобы фоновые циклы (typing/mother/...) ушли
             # на следующей же итерации.
             chat_id = message.chat.id
+            voicemod_active.pop((owner_id, chat_id), None)
             spam_running[chat_id] = False
             mirror_chats.discard(chat_id)
             typing_running[chat_id] = False
@@ -1267,7 +1270,7 @@ async def handle_business_message(message: Message):
         # /voice /audio должны исчезать из чата мгновенно — удаляем СРАЗУ,
         # ДО запуска асинхронной задачи (которая может задержаться).
         # delete_command сам выберет deleteBusinessMessages для бизнес-чата.
-        if cmd in ("typing", "mirror", "ignore", "troll", "voice", "audio", "music", "quran"):
+        if cmd in ("typing", "mirror", "ignore", "troll", "voice", "audio", "music", "quran", "voicemod"):
             try:
                 await delete_command(message, bot)
             except Exception as e:
@@ -1343,6 +1346,10 @@ async def handle_business_message(message: Message):
             # большое сердце из премиум-эмодзи + "I love you 🤍".
             # Длинная (~25 сек), поэтому в фон.
             asyncio.create_task(cmd_love(message, bot))
+        elif cmd == "voicemod":
+            # Изменение голоса: перехватывает исходящие голосовые владельца
+            # и заменяет их версией с ffmpeg-эффектом.
+            asyncio.create_task(cmd_voicemod(message, bot, owner_id))
         elif cmd == "q":
             # Запускаем в фоне: Quotly может занимать 5-15 сек.
             # Если ждать здесь — Telegram передоставит апдейт и обработка задвоится.
@@ -1502,6 +1509,17 @@ async def handle_business_message(message: Message):
                 logging.warning(f"[IGNORE] raw ReadBusinessMessage: {e_raw}")
         except Exception as e:
             logging.warning(f"[IGNORE] read_business_message: {e}")
+
+    # VoiceMod: перехватываем голосовые сообщения владельца.
+    # Делаем ДО mirror/like/url, чтобы гарантировать обработку.
+    if (
+        sender_id is not None
+        and sender_id == owner_id
+        and message.voice is not None
+        and (owner_id, message.chat.id) in voicemod_active
+    ):
+        asyncio.create_task(process_voicemod_voice(message, bot, owner_id))
+        return
 
     # Режим /mirror: повторяем сообщение собеседника от имени владельца.
     # Поддерживаем текст и все типы медиа.
@@ -1756,6 +1774,12 @@ async def handle_deleted_event(event: BusinessMessagesDeleted):
             if cid in cache:
                 cache[cid].pop(msg_id, None)
             skipped_mute += 1
+            continue
+        # Voicemod: оригинальные голосовые, удалённые ботом — не показываем как "удалённые".
+        if (cid, msg_id) in voicemod_deleted_msgs:
+            voicemod_deleted_msgs.discard((cid, msg_id))
+            if cid in cache:
+                cache[cid].pop(msg_id, None)
             continue
         msg = get_cached_message(cid, msg_id)
         if msg:
