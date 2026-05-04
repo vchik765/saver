@@ -35,7 +35,7 @@ _CHILD  = "asetrate=81600,aresample=48000,atempo=0.588"
 _ROBOT  = "vibrato=f=20:d=0.9,aecho=0.7:0.9:30:0.5"
 _ALIEN  = "asetrate=91200,aresample=48000,atempo=0.526,vibrato=f=8:d=1.0"
 _MAN    = "asetrate=26400,aresample=48000,atempo=1.818,bass=g=12,volume=2.0"
-_PIKMI  = "asetrate=88800,aresample=48000,atempo=0.541,vibrato=f=5:d=0.3"
+_PIKMI  = "asetrate=86400,aresample=48000,atempo=0.556,treble=g=7,aecho=0.88:0.9:12:0.06"
 
 VOICE_TYPES: dict[str, str] = {
     "ребенок":       _CHILD,
