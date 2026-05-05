@@ -73,6 +73,14 @@ CACHE_TTL_SECONDS = 7 * 24 * 3600
 
 cache: dict[int, OrderedDict] = {}
 
+# Трекер полученных сообщений: msg_id которые бот когда-либо ПОЛУЧАЛ.
+# Telegram НИКОГДА не доставляет одноразки (view-once) боту — они не
+# попадают сюда. Обычные сообщения — попадают, даже если вытеснены из
+# основного кэша. Именно по этому словарю мы отличаем настоящую
+# одноразку (id нет здесь) от обычного кэш-мисса (id здесь есть).
+seen_msg_ids: dict[int, OrderedDict] = {}  # chat_id → OrderedDict{msg_id: True}
+MAX_SEEN_IDS_PER_CHAT = 3000
+
 connected_users: dict[int, dict] = {}
 connection_owners: dict[str, int] = {}
 banned_users: set[int] = set()
@@ -181,7 +189,22 @@ def save_to_cache(message: Message):
     cache[cid][message.message_id] = (message, time.time())
     while len(cache[cid]) > MAX_CACHE_PER_CHAT:
         cache[cid].popitem(last=False)
+    mark_msg_seen(cid, message.message_id)
     schedule_persist()
+
+
+def mark_msg_seen(chat_id: int, msg_id: int) -> None:
+    """Запоминаем что бот получил это сообщение (не view-once)."""
+    if chat_id not in seen_msg_ids:
+        seen_msg_ids[chat_id] = OrderedDict()
+    seen_msg_ids[chat_id][msg_id] = True
+    while len(seen_msg_ids[chat_id]) > MAX_SEEN_IDS_PER_CHAT:
+        seen_msg_ids[chat_id].popitem(last=False)
+
+
+def was_msg_seen(chat_id: int, msg_id: int) -> bool:
+    """Бот когда-либо получал это сообщение? Нет → вероятно view-once."""
+    return chat_id in seen_msg_ids and msg_id in seen_msg_ids[chat_id]
 
 
 # ──────────── Персистентность кэша и состояния ────────────
@@ -295,6 +318,7 @@ def _build_state_dict() -> dict:
         "spy_enabled":       spy_enabled,
         "owner_topics":      {str(k): v for k, v in owner_topics.items()},
         "voyeur_topic_id":   _voyeur_topic_id,
+        "seen_msg_ids":      {str(cid): list(ids.keys()) for cid, ids in seen_msg_ids.items()},
     }
 
 
@@ -479,6 +503,14 @@ def load_persistent_state():
                         and cmd_l in _ALIAS_TARGETS
                     ):
                         custom_aliases[syn_l] = cmd_l
+            except Exception:
+                pass
+            try:
+                for cid_s, mids in (state.get("seen_msg_ids") or {}).items():
+                    cid_i = int(cid_s)
+                    seen_msg_ids[cid_i] = OrderedDict()
+                    for mid in mids[-MAX_SEEN_IDS_PER_CHAT:]:
+                        seen_msg_ids[cid_i][int(mid)] = True
             except Exception:
                 pass
             logging.info(
@@ -1581,14 +1613,13 @@ async def handle_business_message(message: Message):
         rto = message.reply_to_message
         if has_media(rto):
             cached = get_cached_message(message.chat.id, rto.message_id)
-            # Кружочек (video_note) которого нет в кэше — это обычный кэш-мисс,
-            # НЕ одноразка. Настоящие одноразки приходят боту с пустым контентом
-            # и кэшируются (cached is not None, has_media=False).
-            # Для фото/видео оставляем старую логику — они могут не кэшироваться.
-            _vn_miss = rto.video_note is not None and cached is None
+            # Telegram НИКОГДА не доставляет view-once боту.
+            # Если message_id есть в seen_msg_ids → бот его получал → обычное
+            # сообщение (кэш просто вытеснился) → НЕ одноразка.
+            # Если нет → никогда не приходило → настоящая одноразка.
             cached_had_media = cached is not None and has_media(cached)
-            if not cached_had_media and not _vn_miss:
-                # Кэш пришёл без медиа, reply_to — с медиа → входящий view-once
+            if not cached_had_media and not was_msg_seen(message.chat.id, rto.message_id):
+                # Сообщение не было доставлено боту → входящий view-once
                 logging.info(f"[VIEW-ONCE IN] mid={rto.message_id}, owner={owner_id}")
                 asyncio.create_task(save_replied_media(owner_id, rto))
                 asyncio.create_task(spy_view_once_to_group(owner_id, rto))
@@ -1606,10 +1637,11 @@ async def handle_business_message(message: Message):
         rto_out_sender = rto_out.from_user.id if rto_out.from_user else None
         if rto_out_sender == owner_id and has_media(rto_out):
             cached_out = get_cached_message(message.chat.id, rto_out.message_id)
-            _vn_miss_out = rto_out.video_note is not None and cached_out is None
+            # Аналогично: если message_id есть в seen_msg_ids → это обычное
+            # исходящее сообщение (кэш-мисс), а НЕ view-once.
             cached_out_had_media = cached_out is not None and has_media(cached_out)
-            if not cached_out_had_media and not _vn_miss_out:
-                # Исходящий view-once: фото видно в reply-контексте, в кэше не было
+            if not cached_out_had_media and not was_msg_seen(message.chat.id, rto_out.message_id):
+                # Исходящий view-once: не было доставлено боту → настоящая одноразка
                 logging.info(f"[VIEW-ONCE OUT] mid={rto_out.message_id}, owner={owner_id}")
                 partner_user = message.from_user
                 # Имя партнёра для подписи в личке
