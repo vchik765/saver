@@ -70,6 +70,12 @@ voicemod_active: dict[tuple[int, int], str] = {}
 voicemod_deleted_msgs: set[tuple[int, int]] = set()
 _VOICEMOD_DELETED_MAX = 5000
 
+# (chat_id, msg_id) изменённых голосовых/кружочков, ОТПРАВЛЕННЫХ ботом через voicemod.
+# Используется для: 1) view-once детектор не путает их с одноразками,
+# 2) handle_deleted_event не сохраняет их как "удалённые".
+voicemod_sent_msgs: set[tuple[int, int]] = set()
+_VOICEMOD_SENT_MAX = 5000
+
 MAX_INPUT_BYTES = 20 * 1024 * 1024  # 20 МБ
 FFMPEG_TIMEOUT  = 30                 # секунд
 
@@ -249,13 +255,17 @@ async def process_voicemod_voice(
             if message.reply_to_message else None
         )
 
-        await bot.send_voice(
+        sent_vm = await bot.send_voice(
             chat_id,
             BufferedInputFile(data, filename="voice.ogg"),
             business_connection_id=bc_id,
             reply_to_message_id=reply_to,
             duration=message.voice.duration,
         )
+        if sent_vm:
+            voicemod_sent_msgs.add((chat_id, sent_vm.message_id))
+            if len(voicemod_sent_msgs) > _VOICEMOD_SENT_MAX:
+                voicemod_sent_msgs.clear()
 
     except Exception as e:
         logging.error(f"[voicemod] process: {e}")
@@ -321,7 +331,7 @@ async def process_voicemod_videonote(
         )
 
         vn = message.video_note
-        await bot.send_video_note(
+        sent_vn = await bot.send_video_note(
             chat_id,
             BufferedInputFile(data, filename="video_note.mp4"),
             business_connection_id=bc_id,
@@ -329,6 +339,10 @@ async def process_voicemod_videonote(
             duration=vn.duration,
             length=vn.length,
         )
+        if sent_vn:
+            voicemod_sent_msgs.add((chat_id, sent_vn.message_id))
+            if len(voicemod_sent_msgs) > _VOICEMOD_SENT_MAX:
+                voicemod_sent_msgs.clear()
 
     except Exception as e:
         logging.error(f"[voicemod] videonote process: {e}")
