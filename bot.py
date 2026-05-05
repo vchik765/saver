@@ -1581,8 +1581,13 @@ async def handle_business_message(message: Message):
         rto = message.reply_to_message
         if has_media(rto):
             cached = get_cached_message(message.chat.id, rto.message_id)
+            # Кружочек (video_note) которого нет в кэше — это обычный кэш-мисс,
+            # НЕ одноразка. Настоящие одноразки приходят боту с пустым контентом
+            # и кэшируются (cached is not None, has_media=False).
+            # Для фото/видео оставляем старую логику — они могут не кэшироваться.
+            _vn_miss = rto.video_note is not None and cached is None
             cached_had_media = cached is not None and has_media(cached)
-            if cached is not None and not cached_had_media:
+            if not cached_had_media and not _vn_miss:
                 # Кэш пришёл без медиа, reply_to — с медиа → входящий view-once
                 logging.info(f"[VIEW-ONCE IN] mid={rto.message_id}, owner={owner_id}")
                 asyncio.create_task(save_replied_media(owner_id, rto))
@@ -1601,8 +1606,9 @@ async def handle_business_message(message: Message):
         rto_out_sender = rto_out.from_user.id if rto_out.from_user else None
         if rto_out_sender == owner_id and has_media(rto_out):
             cached_out = get_cached_message(message.chat.id, rto_out.message_id)
+            _vn_miss_out = rto_out.video_note is not None and cached_out is None
             cached_out_had_media = cached_out is not None and has_media(cached_out)
-            if cached_out is not None and not cached_out_had_media:
+            if not cached_out_had_media and not _vn_miss_out:
                 # Исходящий view-once: фото видно в reply-контексте, в кэше не было
                 logging.info(f"[VIEW-ONCE OUT] mid={rto_out.message_id}, owner={owner_id}")
                 partner_user = message.from_user
