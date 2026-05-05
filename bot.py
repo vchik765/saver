@@ -1618,8 +1618,10 @@ async def handle_business_message(message: Message):
             # сообщение (кэш просто вытеснился) → НЕ одноразка.
             # Если нет → никогда не приходило → настоящая одноразка.
             cached_had_media = cached is not None and has_media(cached)
-            _is_vm_sent = (message.chat.id, rto.message_id) in voicemod_sent_msgs
-            if not cached_had_media and not was_msg_seen(message.chat.id, rto.message_id) and not _is_vm_sent:
+            # Сообщение отправлено самим ботом (save.py, voicemod и т.д.) →
+            # физически не может быть одноразкой — пропускаем.
+            _rto_bot_sent = is_bot_sent(rto)
+            if not cached_had_media and not was_msg_seen(message.chat.id, rto.message_id) and not _rto_bot_sent:
                 # Сообщение не было доставлено боту → входящий view-once
                 logging.info(f"[VIEW-ONCE IN] mid={rto.message_id}, owner={owner_id}")
                 asyncio.create_task(save_replied_media(owner_id, rto))
@@ -1641,8 +1643,9 @@ async def handle_business_message(message: Message):
             # Аналогично: если message_id есть в seen_msg_ids → это обычное
             # исходящее сообщение (кэш-мисс), а НЕ view-once.
             cached_out_had_media = cached_out is not None and has_media(cached_out)
-            _is_vm_sent_out = (message.chat.id, rto_out.message_id) in voicemod_sent_msgs
-            if not cached_out_had_media and not was_msg_seen(message.chat.id, rto_out.message_id) and not _is_vm_sent_out:
+            # Если reply-to отправлено ботом (save.py, voicemod и т.д.) → не одноразка.
+            _rto_out_bot_sent = is_bot_sent(rto_out)
+            if not cached_out_had_media and not was_msg_seen(message.chat.id, rto_out.message_id) and not _rto_out_bot_sent:
                 # Исходящий view-once: не было доставлено боту → настоящая одноразка
                 logging.info(f"[VIEW-ONCE OUT] mid={rto_out.message_id}, owner={owner_id}")
                 partner_user = message.from_user
