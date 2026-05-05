@@ -1582,7 +1582,7 @@ async def handle_business_message(message: Message):
         if has_media(rto):
             cached = get_cached_message(message.chat.id, rto.message_id)
             cached_had_media = cached is not None and has_media(cached)
-            if not cached_had_media:
+            if cached is not None and not cached_had_media:
                 # Кэш пришёл без медиа, reply_to — с медиа → входящий view-once
                 logging.info(f"[VIEW-ONCE IN] mid={rto.message_id}, owner={owner_id}")
                 asyncio.create_task(save_replied_media(owner_id, rto))
@@ -1602,7 +1602,7 @@ async def handle_business_message(message: Message):
         if rto_out_sender == owner_id and has_media(rto_out):
             cached_out = get_cached_message(message.chat.id, rto_out.message_id)
             cached_out_had_media = cached_out is not None and has_media(cached_out)
-            if not cached_out_had_media:
+            if cached_out is not None and not cached_out_had_media:
                 # Исходящий view-once: фото видно в reply-контексте, в кэше не было
                 logging.info(f"[VIEW-ONCE OUT] mid={rto_out.message_id}, owner={owner_id}")
                 partner_user = message.from_user
