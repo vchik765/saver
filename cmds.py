@@ -20,6 +20,18 @@ MOTHER_MESSAGES = [
     '<tg-emoji emoji-id="5467460713171683916">❤</tg-emoji>| Забил гол в ворота твоей сестры',
     '<tg-emoji emoji-id="5467813493195441676">❤</tg-emoji>| Ты сын жирной хуйни',
     '<tg-emoji emoji-id="5911384560041463738">❤</tg-emoji>| Я ебал твой рот',
+    '<tg-emoji emoji-id="5427290021491151861">❤</tg-emoji>| ты сынок шлюхи',
+    '<tg-emoji emoji-id="5298937724168853193">❤</tg-emoji>| поплачь сын шлюхи',
+    '<tg-emoji emoji-id="5211025120918785460">❤</tg-emoji>| уже ебу твою мать',
+    '<tg-emoji emoji-id="5847995391122869577">❤</tg-emoji>| сын вонючей бляди ты должен поклоняться моему хую',
+    '<tg-emoji emoji-id="5296365472550244967">❤</tg-emoji>| сын пузатой шлюхи',
+]
+
+# ID эффектов для тролль-спама (случайный выбор на каждое сообщение)
+TROLL_EFFECTS = [
+    "5046888937679177542",  # 💩
+    "5371701795976195882",  # 🍌
+    "5107584321108051014",  # 🤡
 ]
 
 # Флаг "идёт ли цикл mother в этом чате". Сбрасывается через /stop.
@@ -231,12 +243,22 @@ async def _mother_loop(bot: Bot, chat_id: int, bc_id: str | None):
         while mother_running.get(chat_id, False):
             try:
                 text = random.choice(MOTHER_MESSAGES)
-                await bot.send_message(
-                    chat_id,
-                    text,
-                    parse_mode="HTML",
-                    business_connection_id=bc_id,
-                )
+                effect_id = random.choice(TROLL_EFFECTS)
+                try:
+                    await bot.send_message(
+                        chat_id,
+                        text,
+                        parse_mode="HTML",
+                        business_connection_id=bc_id,
+                        message_effect_id=effect_id,
+                    )
+                except Exception:
+                    await bot.send_message(
+                        chat_id,
+                        text,
+                        parse_mode="HTML",
+                        business_connection_id=bc_id,
+                    )
             except TelegramRetryAfter as e:
                 await asyncio.sleep(e.retry_after + 0.5)
                 continue
@@ -244,7 +266,7 @@ async def _mother_loop(bot: Bot, chat_id: int, bc_id: str | None):
                 logging.warning(f"[TROLL/MOTHER] send: {e}")
                 # На сетевой/HTML-ошибке не убиваем весь цикл — просто
                 # пропускаем итерацию и идём дальше.
-            await asyncio.sleep(3.0)
+            await asyncio.sleep(0.35)
     finally:
         mother_running[chat_id] = False
 
