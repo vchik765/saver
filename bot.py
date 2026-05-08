@@ -83,6 +83,7 @@ MAX_SEEN_IDS_PER_CHAT = 3000
 
 connected_users: dict[int, dict] = {}
 connection_owners: dict[str, int] = {}
+user_to_bc: dict[int, str] = {}  # обратный маппинг: user_id → bc_id
 banned_users: set[int] = set()
 stats: dict[str, int] = {"deleted": 0, "edited": 0, "connections": 0}
 
@@ -310,6 +311,7 @@ def _build_state_dict() -> dict:
     return {
         "connection_owners": {str(k): v for k, v in connection_owners.items()},
         "connected_users":   {str(k): v for k, v in connected_users.items()},
+        "user_to_bc":        {str(k): v for k, v in user_to_bc.items()},
         "banned_users":      list(banned_users),
         "stats":             stats,
         "like_mode_keys":    [list(k) for k in like_mode_keys],
@@ -452,6 +454,11 @@ def load_persistent_state():
     if state is not None:
         try:
             connection_owners.update(state.get("connection_owners", {}))
+            for k, v in state.get("user_to_bc", {}).items():
+                try:
+                    user_to_bc[int(k)] = str(v)
+                except (ValueError, TypeError):
+                    pass
             for k, v in state.get("connected_users", {}).items():
                 try:
                     connected_users[int(k)] = v
@@ -640,6 +647,7 @@ async def resolve_owner(business_connection_id: str) -> int:
         bc = await bot.get_business_connection(business_connection_id)
         owner_id = bc.user.id
         connection_owners[business_connection_id] = owner_id
+        user_to_bc[owner_id] = business_connection_id
         connected_users[owner_id] = {
             "name": bc.user.full_name,
             "username": bc.user.username or "",
@@ -1199,6 +1207,7 @@ async def handle_connection(bc: BusinessConnection):
             await bot.send_message(user_id, "🚫 Вы заблокированы и не можете пользоваться ботом.")
             return
         connection_owners[bc.id] = user_id
+        user_to_bc[user_id] = bc.id
         connected_users[user_id] = {
             "name": bc.user.full_name,
             "username": bc.user.username or "",
@@ -1214,6 +1223,7 @@ async def handle_connection(bc: BusinessConnection):
             )
     else:
         connection_owners.pop(bc.id, None)
+        user_to_bc.pop(user_id, None)
         connected_users.pop(user_id, None)
         schedule_persist()
         await bot.send_message(user_id, "❌ Бот отключён от Business аккаунта.")
@@ -2028,7 +2038,7 @@ async def handle_secret_pm(message: Message):
     обёртка, которая прокидывает зависимости (admin_id и словари состояния)."""
     if message.from_user and message.from_user.id in banned_users:
         return
-    await cmd_secret(message, bot, ADMIN_ID, connection_owners, connected_users)
+    await cmd_secret(message, bot, ADMIN_ID, connection_owners, connected_users, user_to_bc)
 
 
 @dp.callback_query(F.data.startswith("secret:"))
