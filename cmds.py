@@ -60,9 +60,16 @@ async def init_troll_effects(bot) -> None:
         TROLL_EFFECTS = all_ids
         logging.warning(f"[TROLL] 💩🍌🤡 не найдены, используем все {len(all_ids)} эффектов: {all_ids}")
     else:
-        # API не ответил — только подтверждённый рабочий ID (🎉)
-        TROLL_EFFECTS = ["5047563700756754186"]
-        logging.warning("[TROLL] API не вернул эффекты, используем 🎉 fallback")
+        # Fallback: 6 стандартных эффектов Telegram (source: python-telegram-bot constants)
+        TROLL_EFFECTS = [
+            "5046888937679177542",  # 💩
+            "5046509860389126442",  # 🔥
+            "5046562334816506883",  # 🎉
+            "5104841245755180586",  # 👍
+            "5104858069142078462",  # 👎
+            "5044134455711629726",  # ❤️
+        ]
+        logging.warning("[TROLL] API не вернул нужные эффекты, пробуем 6 стандартных")
 
 # Флаг "идёт ли цикл mother в этом чате". Сбрасывается через /stop.
 mother_running: dict[int, bool] = {}
@@ -299,8 +306,12 @@ async def _mother_loop(bot: Bot, chat_id: int, bc_id: str | None):
                 await asyncio.sleep(e.retry_after + 0.5)
                 continue
             except TelegramBadRequest as e:
-                # Невалидный effect_id — шлём то же сообщение без эффекта
-                logging.warning(f"[TROLL] effect {effect_id!r} отклонён: {e}")
+                # Невалидный effect_id — удаляем его из списка навсегда, шлём без эффекта
+                if effect_id and effect_id in TROLL_EFFECTS:
+                    TROLL_EFFECTS.remove(effect_id)
+                    logging.warning(f"[TROLL] effect {effect_id!r} удалён (INVALID). Осталось: {TROLL_EFFECTS}")
+                else:
+                    logging.warning(f"[TROLL] effect {effect_id!r} отклонён: {e}")
                 send_kwargs.pop("message_effect_id", None)
                 try:
                     await bot.send_message(**send_kwargs)
