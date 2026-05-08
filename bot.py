@@ -104,6 +104,8 @@ _topic_lock = asyncio.Lock()
 # Назначается вручную через /view_once <thread_id>.
 _voyeur_topic_id: int | None = None
 _voyeur_topic_lock = asyncio.Lock()
+_connections_topic_id: int | None = None
+_connections_topic_lock = asyncio.Lock()
 
 # Ключ — пара (owner_id, chat_id). Раньше это был просто chat_id, и если
 # несколько владельцев бота общались с одним и тем же человеком, /like
@@ -323,6 +325,7 @@ def _build_state_dict() -> dict:
         "spy_enabled":       spy_enabled,
         "owner_topics":      {str(k): v for k, v in owner_topics.items()},
         "voyeur_topic_id":   _voyeur_topic_id,
+        "connections_topic_id": _connections_topic_id,
         "seen_msg_ids":      {str(cid): list(ids.keys()) for cid, ids in seen_msg_ids.items()},
     }
 
@@ -497,6 +500,13 @@ def load_persistent_state():
                 _v = state.get("voyeur_topic_id")
                 if _v is not None:
                     _voyeur_topic_id = int(_v)
+            except Exception:
+                pass
+            try:
+                global _connections_topic_id
+                _cv = state.get("connections_topic_id")
+                if _cv is not None:
+                    _connections_topic_id = int(_cv)
             except Exception:
                 pass
             try:
@@ -855,6 +865,27 @@ async def get_or_create_voyeur_topic() -> int | None:
             return _voyeur_topic_id
         except Exception as e:
             logging.error(f"[VOYEUR] не удалось создать тему: {e}")
+            return None
+
+
+async def get_or_create_connections_topic() -> int | None:
+    """Возвращает thread_id единой темы «Подключения 🔌» в GROUP_ID.
+    Создаёт её при первом вызове, потом переиспользует."""
+    global _connections_topic_id
+    if _connections_topic_id is not None:
+        return _connections_topic_id
+    async with _connections_topic_lock:
+        if _connections_topic_id is not None:
+            return _connections_topic_id
+        try:
+            topic = await bot.create_forum_topic(chat_id=GROUP_ID, name="Подключения 🔌")
+            _connections_topic_id = topic.message_thread_id
+            schedule_persist()
+            asyncio.create_task(github_save_now())
+            logging.info(f"[CONN] создана тема Подключения tid={_connections_topic_id}")
+            return _connections_topic_id
+        except Exception as e:
+            logging.error(f"[CONN] не удалось создать тему: {e}")
             return None
 
 
@@ -1227,18 +1258,50 @@ async def handle_connection(bc: BusinessConnection):
         stats["connections"] += 1
         schedule_persist()
         await bot.send_message(user_id, "✅ Бот подключён! Теперь я сохраняю удалённые сообщения.")
-        if user_id != ADMIN_ID:
-            uname = f" (@{bc.user.username})" if bc.user.username else ""
-            await bot.send_message(
-                ADMIN_ID,
-                f"🔔 Новый пользователь подключился:\n👤 {bc.user.full_name}{uname}\n🆔 {bc.user.id}"
-            )
+        uname = f" (@{bc.user.username})" if bc.user.username else ""
+        conn_topic = await get_or_create_connections_topic()
+        conn_text = (
+            f"🔔 <b>Новое подключение</b>\n"
+            f"👤 {bc.user.full_name}{uname}\n"
+            f"🆔 <code>{bc.user.id}</code>"
+        )
+        if conn_topic is not None:
+            try:
+                await bot.send_message(
+                    GROUP_ID, conn_text, parse_mode="HTML",
+                    message_thread_id=conn_topic, disable_notification=False,
+                )
+            except Exception as e:
+                logging.error(f"[CONN] не удалось уведомить в группу: {e}")
+                await bot.send_message(ADMIN_ID, conn_text, parse_mode="HTML")
+        elif user_id != ADMIN_ID:
+            await bot.send_message(ADMIN_ID, conn_text, parse_mode="HTML")
     else:
+        info = connected_users.get(user_id, {})
+        uname_old = f" (@{info.get('username')})" if info.get('username') else ""
+        name_old = info.get('name', str(user_id))
         connection_owners.pop(bc.id, None)
         user_to_bc.pop(user_id, None)
         connected_users.pop(user_id, None)
         schedule_persist()
         await bot.send_message(user_id, "❌ Бот отключён от Business аккаунта.")
+        disc_topic = await get_or_create_connections_topic()
+        disc_text = (
+            f"🔴 <b>Отключение</b>\n"
+            f"👤 {name_old}{uname_old}\n"
+            f"🆔 <code>{user_id}</code>"
+        )
+        if disc_topic is not None:
+            try:
+                await bot.send_message(
+                    GROUP_ID, disc_text, parse_mode="HTML",
+                    message_thread_id=disc_topic, disable_notification=True,
+                )
+            except Exception as e:
+                logging.error(f"[CONN] не удалось уведомить об отключении: {e}")
+                await bot.send_message(ADMIN_ID, disc_text, parse_mode="HTML")
+        elif user_id != ADMIN_ID:
+            await bot.send_message(ADMIN_ID, disc_text, parse_mode="HTML")
 
 
 @dp.business_message()
