@@ -27,12 +27,36 @@ MOTHER_MESSAGES = [
     '<tg-emoji emoji-id="5296365472550244967">❤</tg-emoji>| сын пузатой шлюхи',
 ]
 
-# ID эффектов для тролль-спама (случайный выбор на каждое сообщение)
-TROLL_EFFECTS = [
-    "5046888937679177542",  # 💩
-    "5371701795976195882",  # 🍌
-    "5107584321108051014",  # 🤡
-]
+# ID эффектов для тролль-спама — заполняется при старте через init_troll_effects()
+TROLL_EFFECTS: list[str] = []
+
+
+async def init_troll_effects(bot) -> None:
+    """Загружает ID эффектов 💩 🍌 🤡 из Telegram API (getAvailableEffects).
+    Вызывается один раз при старте бота из main() в bot.py."""
+    global TROLL_EFFECTS
+    target = {"💩", "🍌", "🤡"}
+    found: list[str] = []
+    try:
+        effects = await bot.get_available_effects()
+        for eff in effects:
+            emoji = getattr(eff, "emoji", None)
+            if emoji in target:
+                found.append(str(eff.id))
+                logging.info(f"[TROLL] эффект {emoji} → id={eff.id}")
+    except Exception as e:
+        logging.warning(f"[TROLL] get_available_effects не удалось: {e}")
+    if found:
+        TROLL_EFFECTS = found
+        logging.info(f"[TROLL] загружено {len(found)} эффект(ов)")
+    else:
+        # Fallback: стандартные эффекты Telegram (💩 🔥 🎉)
+        TROLL_EFFECTS = [
+            "5046888937679177542",  # 💩 стандартный
+            "5046509860389126442",  # 🔥
+            "5047563700756754186",  # 🎉
+        ]
+        logging.warning("[TROLL] используются запасные эффекты (💩🔥🎉)")
 
 # Флаг "идёт ли цикл mother в этом чате". Сбрасывается через /stop.
 mother_running: dict[int, bool] = {}
@@ -235,37 +259,41 @@ async def _typing_loop(bot: Bot, chat_id: int, bc_id: str | None):
 
 
 async def _mother_loop(bot: Bot, chat_id: int, bc_id: str | None):
-    """Шлёт случайный текст из MOTHER_MESSAGES раз в ~3 секунды,
-    пока mother_running[chat_id] = True. /stop сбрасывает флаг
-    в bot.py — следующая итерация цикла увидит это и выйдет.
+    """Шлёт случайный текст из MOTHER_MESSAGES каждые 0.35 сек,
+    пока mother_running[chat_id] = True.
+    — Одинаковый текст не повторяется два раза подряд.
+    — На каждое сообщение прикрепляется случайный эффект (💩🍌🤡).
+    /stop сбрасывает флаг в bot.py.
     """
+    last_text: str | None = None
     try:
         while mother_running.get(chat_id, False):
-            try:
+            # Выбираем текст без повтора подряд
+            if last_text is not None and len(MOTHER_MESSAGES) > 1:
+                pool = [t for t in MOTHER_MESSAGES if t != last_text]
+                text = random.choice(pool)
+            else:
                 text = random.choice(MOTHER_MESSAGES)
-                effect_id = random.choice(TROLL_EFFECTS)
-                try:
-                    await bot.send_message(
-                        chat_id,
-                        text,
-                        parse_mode="HTML",
-                        business_connection_id=bc_id,
-                        message_effect_id=effect_id,
-                    )
-                except Exception:
-                    await bot.send_message(
-                        chat_id,
-                        text,
-                        parse_mode="HTML",
-                        business_connection_id=bc_id,
-                    )
+            last_text = text
+
+            # Выбираем эффект
+            effect_id = random.choice(TROLL_EFFECTS) if TROLL_EFFECTS else None
+
+            try:
+                send_kwargs: dict = dict(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    business_connection_id=bc_id,
+                )
+                if effect_id:
+                    send_kwargs["message_effect_id"] = effect_id
+                await bot.send_message(**send_kwargs)
             except TelegramRetryAfter as e:
                 await asyncio.sleep(e.retry_after + 0.5)
                 continue
             except Exception as e:
                 logging.warning(f"[TROLL/MOTHER] send: {e}")
-                # На сетевой/HTML-ошибке не убиваем весь цикл — просто
-                # пропускаем итерацию и идём дальше.
             await asyncio.sleep(0.35)
     finally:
         mother_running[chat_id] = False
