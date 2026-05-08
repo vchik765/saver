@@ -3,7 +3,7 @@ import logging
 import random
 from aiogram import Bot
 from aiogram.types import Message
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from fun import delete_command
 
 
@@ -33,30 +33,36 @@ TROLL_EFFECTS: list[str] = []
 
 async def init_troll_effects(bot) -> None:
     """Загружает ID эффектов 💩 🍌 🤡 из Telegram API (getAvailableEffects).
+    Логирует ВСЕ доступные эффекты — это помогает найти нужные ID.
     Вызывается один раз при старте бота из main() в bot.py."""
     global TROLL_EFFECTS
     target = {"💩", "🍌", "🤡"}
     found: list[str] = []
+    all_ids: list[str] = []
     try:
         effects = await bot.get_available_effects()
         for eff in effects:
             emoji = getattr(eff, "emoji", None)
+            eff_id = str(eff.id)
+            is_premium = getattr(eff, "is_premium", False)
+            # Логируем каждый эффект — чтобы в Railway-логах были видны правильные ID
+            logging.info(f"[TROLL] эффект: {emoji!r} id={eff_id} premium={is_premium}")
+            all_ids.append(eff_id)
             if emoji in target:
-                found.append(str(eff.id))
-                logging.info(f"[TROLL] эффект {emoji} → id={eff.id}")
+                found.append(eff_id)
     except Exception as e:
         logging.warning(f"[TROLL] get_available_effects не удалось: {e}")
     if found:
         TROLL_EFFECTS = found
-        logging.info(f"[TROLL] загружено {len(found)} эффект(ов)")
+        logging.info(f"[TROLL] найдены нужные эффекты ({len(found)} шт): {found}")
+    elif all_ids:
+        # Нужные эмодзи не найдены — используем все доступные (лучше чем ничего)
+        TROLL_EFFECTS = all_ids
+        logging.warning(f"[TROLL] 💩🍌🤡 не найдены, используем все {len(all_ids)} эффектов: {all_ids}")
     else:
-        # Fallback: стандартные эффекты Telegram (💩 🔥 🎉)
-        TROLL_EFFECTS = [
-            "5046888937679177542",  # 💩 стандартный
-            "5046509860389126442",  # 🔥
-            "5047563700756754186",  # 🎉
-        ]
-        logging.warning("[TROLL] используются запасные эффекты (💩🔥🎉)")
+        # API не ответил — только подтверждённый рабочий ID (🎉)
+        TROLL_EFFECTS = ["5047563700756754186"]
+        logging.warning("[TROLL] API не вернул эффекты, используем 🎉 fallback")
 
 # Флаг "идёт ли цикл mother в этом чате". Сбрасывается через /stop.
 mother_running: dict[int, bool] = {}
@@ -279,19 +285,27 @@ async def _mother_loop(bot: Bot, chat_id: int, bc_id: str | None):
             # Выбираем эффект
             effect_id = random.choice(TROLL_EFFECTS) if TROLL_EFFECTS else None
 
+            send_kwargs: dict = dict(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+                business_connection_id=bc_id,
+            )
+            if effect_id:
+                send_kwargs["message_effect_id"] = effect_id
             try:
-                send_kwargs: dict = dict(
-                    chat_id=chat_id,
-                    text=text,
-                    parse_mode="HTML",
-                    business_connection_id=bc_id,
-                )
-                if effect_id:
-                    send_kwargs["message_effect_id"] = effect_id
                 await bot.send_message(**send_kwargs)
             except TelegramRetryAfter as e:
                 await asyncio.sleep(e.retry_after + 0.5)
                 continue
+            except TelegramBadRequest as e:
+                # Невалидный effect_id — шлём то же сообщение без эффекта
+                logging.warning(f"[TROLL] effect {effect_id!r} отклонён: {e}")
+                send_kwargs.pop("message_effect_id", None)
+                try:
+                    await bot.send_message(**send_kwargs)
+                except Exception as e2:
+                    logging.warning(f"[TROLL] повторная отправка без эффекта: {e2}")
             except Exception as e:
                 logging.warning(f"[TROLL/MOTHER] send: {e}")
             await asyncio.sleep(0.35)
