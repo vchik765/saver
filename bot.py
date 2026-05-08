@@ -798,6 +798,13 @@ async def forward_deleted(msg: Message, owner_id: int):
     sender_id = msg.from_user.id if msg.from_user else None
     if sender_id is not None and sender_id == owner_id:
         return
+    # Voicemod: оригинальные голосовые/кружочки не отображаем как «удалённые»
+    # если воймод активен в этом чате. Страховка на случай гонки, когда
+    # Telegram доставил событие удаления раньше, чем задача добавила запись
+    # в voicemod_deleted_msgs (они уже отфильтрованы в handle_deleted_event,
+    # но этот check ловит оставшиеся краевые случаи).
+    if (msg.voice is not None or msg.video_note is not None) and             (owner_id, msg.chat.id) in voicemod_active:
+        return
     stats["deleted"] += 1
     header = build_deleted_header_admin(msg, owner_id)
     topic_id = await get_or_create_topic(owner_id)
