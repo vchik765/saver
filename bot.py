@@ -7,7 +7,7 @@ import time
 import urllib.request
 import urllib.error
 from pathlib import Path
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from io import BytesIO
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -41,6 +41,24 @@ from voicemod import cmd_voicemod, process_voicemod_voice, process_voicemod_vide
 from secret import cmd_secret, handle_secret_callback
 
 logging.basicConfig(level=logging.INFO)
+
+# Кольцевой буфер последних 300 лог-строк — для команды /logs прямо в Telegram
+_log_buffer: deque = deque(maxlen=300)
+
+
+class _TGLogHandler(logging.Handler):
+    """Сохраняет записи в _log_buffer; /logs отправляет их в чат."""
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            _log_buffer.append(self.format(record))
+        except Exception:
+            pass
+
+
+_tg_log_fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s", datefmt="%H:%M:%S")
+_tg_handler = _TGLogHandler()
+_tg_handler.setFormatter(_tg_log_fmt)
+logging.getLogger().addHandler(_tg_handler)
 
 TOKEN2 = os.getenv("TOKEN2")
 _admin_raw = os.getenv("ADMIN_ID", "")
@@ -2482,6 +2500,23 @@ async def handle_alias(message: Message):
         "<i>Точка в начале синонима обязательна.</i>",
         parse_mode="HTML",
     )
+
+
+@dp.message(Command("logs"))
+async def cmd_logs(message: Message) -> None:
+    """Отправляет последние записи из лога прямо в Telegram (только для ADMIN_ID)."""
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    if not _log_buffer:
+        await message.answer("Лог пуст — бот только что стартовал.")
+        return
+    lines = list(_log_buffer)[-60:]
+    text = "
+".join(lines)
+    MAX = 3900
+    chunks = [text[i:i + MAX] for i in range(0, len(text), MAX)]
+    for chunk in chunks[-3:]:  # максимум 3 сообщения
+        await message.answer(f"<pre>{chunk}</pre>", parse_mode="HTML")
 
 
 async def main():
