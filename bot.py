@@ -1816,7 +1816,7 @@ async def handle_edited(message: Message):
         if info:
             owner_display = escape_html(info["name"])
             if info.get("username"):
-                        owner_display += f", @{info['username']}"
+                owner_display += f", @{info['username']}"
             owner_display += f" [ID: {owner_id}]"
         else:
             owner_display = str(owner_id)
