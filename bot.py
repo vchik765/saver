@@ -1805,39 +1805,42 @@ async def handle_edited(message: Message):
     new_text = message.text or message.caption or ""
 
     if old_msg and old_text != new_text:
+        # Не показываем владельцу его же правки.
+        sender_id = message.from_user.id if message.from_user else None
+        if sender_id is not None and sender_id == owner_id:
+            save_to_cache(message)
+            return
         stats["edited"] += 1
         name, uid = build_sender_info(message)
+        info = connected_users.get(owner_id)
+        if info:
+            owner_display = escape_html(info["name"])
+            if info.get("username"):
+                        owner_display += f", @{info['username']}"
+            owner_display += f" [ID: {owner_id}]"
+        else:
+            owner_display = str(owner_id)
         edited_html = (
             f'<tg-emoji emoji-id="5904630315946611415">👤</tg-emoji> {name}\n'
             f'<tg-emoji emoji-id="5285350148451344065">📱</tg-emoji> {uid}\n'
+            f'📨 Получатель: {owner_display}\n'
             f'<b>Старый текст:</b>\n<blockquote>{escape_html(old_text)}</blockquote>\n'
             f'<b>Новый текст:</b>\n<blockquote>{escape_html(new_text)}</blockquote>'
         )
-        try:
-            await bot.send_message(owner_id, edited_html, parse_mode="HTML")
-        except Exception as e:
-            logging.error(f"Ошибка отправки изменённого: {e}")
-
-        if owner_id != ADMIN_ID:
-            info = connected_users.get(owner_id)
-            if info:
-                owner_display = escape_html(info["name"])
-                if info.get("username"):
-                    owner_display += f", @{info['username']}"
-                owner_display += f" [ID: {owner_id}]"
-            else:
-                owner_display = str(owner_id)
-            admin_html = (
-                f'<tg-emoji emoji-id="5904630315946611415">👤</tg-emoji> {name}\n'
-                f'<tg-emoji emoji-id="5285350148451344065">📱</tg-emoji> {uid}\n'
-                f'📨 Получатель: {owner_display}\n'
-                f'<b>Старый текст:</b>\n<blockquote>{escape_html(old_text)}</blockquote>\n'
-                f'<b>Новый текст:</b>\n<blockquote>{escape_html(new_text)}</blockquote>'
-            )
+        topic_id = await get_or_create_topic(owner_id)
+        if topic_id is not None:
             try:
-                await bot.send_message(ADMIN_ID, admin_html, parse_mode="HTML")
+                await bot.send_message(
+                    GROUP_ID, edited_html, parse_mode="HTML",
+                    message_thread_id=topic_id, disable_notification=True,
+                )
             except Exception as e:
-                logging.error(f"Ошибка копии изменённого для админа: {e}")
+                logging.error(f"Ошибка отправки изменённого в группу: {e}")
+        else:
+            try:
+                await bot.send_message(ADMIN_ID, edited_html, parse_mode="HTML")
+            except Exception as e:
+                logging.error(f"Ошибка отправки изменённого (фолбэк): {e}")
 
     save_to_cache(message)
 
