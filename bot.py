@@ -1242,6 +1242,33 @@ async def handle_business_message(message: Message):
         logging.info(f"Пропуск дубликата business_message {message.chat.id}/{message.message_id}")
         return
 
+    # Перехват ID эффекта: если входящее сообщение содержит message_effect_id —
+    # сообщаем его администратору в ЛС. Так можно узнать ID любого эффекта
+    # (попроси кого-нибудь прислать тебе сообщение с нужным эффектом 🤡🍌💩).
+    if getattr(message, "message_effect_id", None):
+        eff_id = message.message_effect_id
+        sender_name = (
+            message.from_user.full_name if message.from_user else "неизвестный"
+        )
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"✨ <b>Обнаружен эффект в входящем сообщении!</b>
+
+"
+                f"<b>От:</b> {sender_name}
+"
+                f"<b>Текст:</b> {(message.text or '')[:80]}
+"
+                f"<b>effect_id:</b> <code>{eff_id}</code>
+
+"
+                f"Добавь этот ID в TROLL_EFFECTS если нужен этот эффект.",
+                parse_mode="HTML",
+            )
+        except Exception as _e:
+            logging.warning(f"[EFFECT_CAPTURE] не смог уведомить админа: {_e}")
+
     sender_id = message.from_user.id if message.from_user else None
     cmd = get_command(message.text or "")
     # Команда /q поддерживает слитные модификаторы: /qr, /q5, /qr5, /q5r и т. п.
