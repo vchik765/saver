@@ -1253,16 +1253,10 @@ async def handle_business_message(message: Message):
         try:
             await bot.send_message(
                 ADMIN_ID,
-                f"✨ <b>Обнаружен эффект в входящем сообщении!</b>
-
-"
-                f"<b>От:</b> {sender_name}
-"
-                f"<b>Текст:</b> {(message.text or '')[:80]}
-"
-                f"<b>effect_id:</b> <code>{eff_id}</code>
-
-"
+                f"✨ <b>Обнаружен эффект в входящем сообщении!</b>\n\n"
+                f"<b>От:</b> {sender_name}\n"
+                f"<b>Текст:</b> {(message.text or '')[:80]}\n"
+                f"<b>effect_id:</b> <code>{eff_id}</code>\n\n"
                 f"Добавь этот ID в TROLL_EFFECTS если нужен этот эффект.",
                 parse_mode="HTML",
             )
