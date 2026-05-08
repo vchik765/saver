@@ -79,13 +79,25 @@ async def _resolve_target(bot: Bot, raw: str) -> tuple[int | None, str]:
         return None, "не указан получатель"
 
     if raw.lstrip("-").isdigit():
+        uid = int(raw)
+        # Быстрый путь: пользователь есть в словаре подключённых
+        if uid in connected_users:
+            info = connected_users[uid]
+            name = info.get("name") or str(uid)
+            if info.get("username"):
+                name += f" (@{info['username']})"
+            return uid, name
+        # Медленный путь: запрос к Telegram API
         try:
-            chat = await bot.get_chat(int(raw))
+            chat = await bot.get_chat(uid)
             name = get_display_name(chat) or str(chat.id)
             return chat.id, name
         except Exception as e:
             logging.warning(f"/secret: get_chat по id={raw}: {e}")
-            return None, f"не нашёл пользователя по id {raw}"
+            return None, (
+                f"не нашёл пользователя с id {raw}. "
+                f"Убедись что id верный, или используй @username."
+            )
 
     username = raw if raw.startswith("@") else "@" + raw
     try:
@@ -155,6 +167,7 @@ async def cmd_secret(
     admin_id: int,
     connection_owners: dict[str, int],
     connected_users: dict[int, dict],
+    user_to_bc: dict[int, str] | None = None,
 ) -> None:
     """Обработчик /secret в ЛС с ботом. Зарегистрирован в bot.py."""
     if not message.from_user:
@@ -177,17 +190,22 @@ async def cmd_secret(
 
     target_raw = parts[1].strip()
 
-    # Проверяем, что отправитель — владелец бизнес-подключения.
+    # Ищем bc_id отправителя: сначала быстрый обратный маппинг,
+    # затем перебор connection_owners как запасной вариант.
     bc_id: str | None = None
-    for bid, oid in connection_owners.items():
-        if oid == sender_id:
-            bc_id = bid
-            break
+    if user_to_bc:
+        bc_id = user_to_bc.get(sender_id)
+    if not bc_id:
+        for bid, oid in connection_owners.items():
+            if oid == sender_id:
+                bc_id = bid
+                break
     if not bc_id:
         await message.reply(
-            "❗ Чтобы отправить секретное сообщение, у тебя должен быть "
-            "подключён этот бот в Telegram → Настройки → Бизнес → Чат-боты. "
-            "Без бизнес-подключения я не могу написать от твоего имени."
+            "\u2757 \u0411\u0438\u0437\u043d\u0435\u0441-\u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u043e.\n\n"
+            "\u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439: \u043e\u0442\u043a\u043b\u044e\u0447\u0438 \u0431\u043e\u0442\u0430 \u0432 \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0430\u0445 \u0438 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0438 \u0441\u043d\u043e\u0432\u0430 — "
+            "\u043f\u043e\u0441\u043b\u0435 \u043f\u0435\u0440\u0435\u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f \u043a\u043e\u043c\u0430\u043d\u0434\u0430 \u0437\u0430\u0440\u0430\u0431\u043e\u0442\u0430\u0435\u0442.\n"
+            "(\u041f\u0440\u043e\u0444\u0438\u043b\u044c \u0431\u043e\u0442\u0430 \u2192 \u0410\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0437\u0430\u0446\u0438\u044f \u0447\u0430\u0442\u043e\u0432 \u0438\u043b\u0438 \u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 \u2192 \u0411\u0438\u0437\u043d\u0435\u0441 \u2192 \u0427\u0430\u0442-\u0431\u043e\u0442\u044b)"
         )
         return
 
