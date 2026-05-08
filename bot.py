@@ -22,6 +22,8 @@ from cmds import (
     cmd_id,
     cmd_mute, cmd_unmute, cmd_mirror, cmd_typing, cmd_ignore, typing_running,
     cmd_troll, mother_running,
+
+    init_troll_effects,
 )
 from quote import cmd_quote
 from search import cmd_search
@@ -2484,6 +2486,7 @@ async def handle_alias(message: Message):
 
 async def main():
     load_persistent_state()
+    await init_troll_effects(bot)
     asyncio.create_task(cache_cleanup_task())
     asyncio.create_task(persist_loop())
     asyncio.create_task(github_persist_loop())
