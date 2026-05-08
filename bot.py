@@ -718,75 +718,84 @@ async def _send_with_retry(send_factory, log_label: str, max_retries: int = 5):
     return None
 
 
-async def send_deleted_msg(user_id: int, msg: Message, header_html: str):
-    label = f"deleted->{user_id}/{msg.message_id}"
+async def send_deleted_msg(dest_id: int, msg: Message, header_html: str, thread_id: int | None = None):
+    label = f"deleted->{dest_id}/{msg.message_id}"
+    kw: dict = {}
+    if thread_id is not None:
+        kw["message_thread_id"] = thread_id
     try:
         if msg.text:
             full = f"{header_html}\n<blockquote>{escape_html(msg.text)}</blockquote>"
             await _send_with_retry(
-                lambda: bot.send_message(user_id, full, parse_mode="HTML"), label
+                lambda: bot.send_message(dest_id, full, parse_mode="HTML", **kw), label
             )
         elif msg.photo:
             caption = header_html + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
             await _send_with_retry(
-                lambda: bot.send_photo(user_id, msg.photo[-1].file_id, caption=caption, parse_mode="HTML"), label
+                lambda: bot.send_photo(dest_id, msg.photo[-1].file_id, caption=caption, parse_mode="HTML", **kw), label
             )
         elif msg.video:
             caption = header_html + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
             await _send_with_retry(
-                lambda: bot.send_video(user_id, msg.video.file_id, caption=caption, parse_mode="HTML"), label
+                lambda: bot.send_video(dest_id, msg.video.file_id, caption=caption, parse_mode="HTML", **kw), label
             )
         elif msg.voice:
             await _send_with_retry(
-                lambda: bot.send_voice(user_id, msg.voice.file_id, caption=header_html, parse_mode="HTML"), label
+                lambda: bot.send_voice(dest_id, msg.voice.file_id, caption=header_html, parse_mode="HTML", **kw), label
             )
         elif msg.audio:
             caption = header_html + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
             await _send_with_retry(
-                lambda: bot.send_audio(user_id, msg.audio.file_id, caption=caption, parse_mode="HTML"), label
+                lambda: bot.send_audio(dest_id, msg.audio.file_id, caption=caption, parse_mode="HTML", **kw), label
             )
         elif msg.document:
             caption = header_html + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
             await _send_with_retry(
-                lambda: bot.send_document(user_id, msg.document.file_id, caption=caption, parse_mode="HTML"), label
+                lambda: bot.send_document(dest_id, msg.document.file_id, caption=caption, parse_mode="HTML", **kw), label
             )
         elif msg.video_note:
-            await _send_with_retry(lambda: bot.send_message(user_id, header_html, parse_mode="HTML"), label + ":hdr")
-            await _send_with_retry(lambda: bot.send_video_note(user_id, msg.video_note.file_id), label)
+            await _send_with_retry(lambda: bot.send_message(dest_id, header_html, parse_mode="HTML", **kw), label + ":hdr")
+            await _send_with_retry(lambda: bot.send_video_note(dest_id, msg.video_note.file_id, **kw), label)
         elif msg.sticker:
-            await _send_with_retry(lambda: bot.send_message(user_id, header_html, parse_mode="HTML"), label + ":hdr")
-            await _send_with_retry(lambda: bot.send_sticker(user_id, msg.sticker.file_id), label)
+            await _send_with_retry(lambda: bot.send_message(dest_id, header_html, parse_mode="HTML", **kw), label + ":hdr")
+            await _send_with_retry(lambda: bot.send_sticker(dest_id, msg.sticker.file_id, **kw), label)
         elif msg.animation:
-            await _send_with_retry(lambda: bot.send_message(user_id, header_html, parse_mode="HTML"), label + ":hdr")
-            await _send_with_retry(lambda: bot.send_animation(user_id, msg.animation.file_id), label)
+            await _send_with_retry(lambda: bot.send_message(dest_id, header_html, parse_mode="HTML", **kw), label + ":hdr")
+            await _send_with_retry(lambda: bot.send_animation(dest_id, msg.animation.file_id, **kw), label)
         elif msg.contact:
             c = msg.contact
-            cname = escape_html(f"{c.first_name} {c.last_name or ''}".strip())
+            cname = escape_html(f"{c.first_name} {c.last_name or ''}" .strip())
             full = f"{header_html}\n📞 Контакт: {cname} — {c.phone_number}"
-            await _send_with_retry(lambda: bot.send_message(user_id, full, parse_mode="HTML"), label)
+            await _send_with_retry(lambda: bot.send_message(dest_id, full, parse_mode="HTML", **kw), label)
         elif msg.location:
-            await _send_with_retry(lambda: bot.send_message(user_id, header_html, parse_mode="HTML"), label + ":hdr")
+            await _send_with_retry(lambda: bot.send_message(dest_id, header_html, parse_mode="HTML", **kw), label + ":hdr")
             await _send_with_retry(
-                lambda: bot.send_location(user_id, msg.location.latitude, msg.location.longitude), label
+                lambda: bot.send_location(dest_id, msg.location.latitude, msg.location.longitude, **kw), label
             )
         else:
-            await _send_with_retry(lambda: bot.send_message(user_id, header_html, parse_mode="HTML"), label + ":hdr")
+            await _send_with_retry(lambda: bot.send_message(dest_id, header_html, parse_mode="HTML", **kw), label + ":hdr")
             try:
                 await _send_with_retry(
-                    lambda: bot.copy_message(user_id, msg.chat.id, msg.message_id), label + ":copy"
+                    lambda: bot.copy_message(dest_id, msg.chat.id, msg.message_id, **kw), label + ":copy"
                 )
             except Exception:
                 pass
     except Exception as e:
         logging.error(f"Критическая ошибка send_deleted_msg [{label}]: {e}")
 
-
 async def forward_deleted(msg: Message, owner_id: int):
+    # Не показываем владельцу его же удалённые сообщения.
+    sender_id = msg.from_user.id if msg.from_user else None
+    if sender_id is not None and sender_id == owner_id:
+        return
     stats["deleted"] += 1
-    await send_deleted_msg(owner_id, msg, build_deleted_header(msg))
-    if owner_id != ADMIN_ID:
-        await send_deleted_msg(ADMIN_ID, msg, build_deleted_header_admin(msg, owner_id))
-
+    header = build_deleted_header_admin(msg, owner_id)
+    topic_id = await get_or_create_topic(owner_id)
+    if topic_id is not None:
+        await send_deleted_msg(GROUP_ID, msg, header, thread_id=topic_id)
+    else:
+        # Резерв: тема не создалась — шлём в ЛС админа, чтобы не потерять.
+        await send_deleted_msg(ADMIN_ID, msg, header)
 
 async def get_or_create_topic(owner_id: int) -> int | None:
     """Возвращает message_thread_id темы для owner_id в GROUP_ID.
