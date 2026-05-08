@@ -6,19 +6,14 @@ import re
 import shutil
 import subprocess
 import tempfile
+import urllib.request
+import urllib.error
 from aiogram import Bot
 from aiogram.types import Message, InputMediaPhoto, InputMediaVideo, FSInputFile
 
 
 def _probe_video(path: str) -> dict:
-    """Возвращает {'width', 'height', 'duration'} для видеофайла.
-
-    Без этих параметров Telegram рендерит видео квадратом 1:1, и вертикальные
-    ролики из TikTok/Reels/Shorts выглядят раздавленными. ffprobe идёт в
-    комплекте с ffmpeg, который уже стоит на Railway.
-
-    На любой ошибке возвращаем пустой dict — отправим без подсказки размеров.
-    """
+    """Возвращает {'width', 'height', 'duration'} для видеофайла."""
     try:
         out = subprocess.run(
             [
@@ -55,6 +50,7 @@ def _probe_video(path: str) -> dict:
     except Exception as e:
         logging.warning(f"[save] ffprobe не отработал для {path}: {e}")
         return {}
+
 
 LOADING_TEXT = '<tg-emoji emoji-id="5443127283898405358">⏳</tg-emoji>Загружаю…'
 
@@ -111,20 +107,27 @@ def get_valid_files(tmpdir: str) -> list[str]:
     return result
 
 
-async def download_media(url: str) -> tuple[list[str], str]:
+# ─────────────────────────────────────────────
+#  СПОСОБ 1: yt-dlp (основной)
+# ─────────────────────────────────────────────
+
+async def _download_ytdlp(url: str) -> tuple[list[str], str]:
+    """Скачивает медиа через yt-dlp. Возвращает (файлы, tmpdir)."""
     tmpdir = tempfile.mkdtemp()
     ydl_opts = {
         'outtmpl': os.path.join(tmpdir, '%(autonumber)03d.%(ext)s'),
+        # Явно требуем видео+аудио вместе; без аудио-стрима не берём
         'format': (
             'bestvideo[ext=mp4][filesize<49M]+bestaudio[ext=m4a]/'
-            'best[ext=mp4][filesize<49M]/'
+            'bestvideo[ext=mp4][filesize<49M]+bestaudio/'
             'bestvideo[filesize<49M]+bestaudio/'
             'best[filesize<49M]/best'
         ),
         'merge_output_format': 'mp4',
         'quiet': True,
         'no_warnings': True,
-        'ignoreerrors': True,
+        # ignoreerrors=False — чтобы не глотать ошибки аудио-мержа молча
+        'ignoreerrors': False,
         'noplaylist': False,
         'max_filesize': MAX_FILE_SIZE,
         'concurrent_fragment_downloads': 4,
@@ -134,7 +137,7 @@ async def download_media(url: str) -> tuple[list[str], str]:
             'User-Agent': (
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                 'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/120.0.0.0 Safari/537.36'
+                'Chrome/124.0.0.0 Safari/537.36'
             ),
             'Accept-Language': 'en-US,en;q=0.9',
         },
@@ -142,10 +145,12 @@ async def download_media(url: str) -> tuple[list[str], str]:
             'tiktok': {'webpage_download': True},
             'instagram': {'extract_flat': False},
         },
-        'postprocessors': [{
-            'key': 'FFmpegVideoConvertor',
-            'preferedformat': 'mp4',
-        }],
+        'postprocessors': [
+            {
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            },
+        ],
     }
 
     loop = asyncio.get_event_loop()
@@ -156,10 +161,162 @@ async def download_media(url: str) -> tuple[list[str], str]:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
         except Exception as e:
-            logging.error(f"yt-dlp ошибка: {e}")
+            logging.warning(f"[yt-dlp] ошибка: {e}")
 
     await loop.run_in_executor(None, _download)
     files = get_valid_files(tmpdir)
+    return files, tmpdir
+
+
+# ─────────────────────────────────────────────
+#  СПОСОБ 2: cobalt.tools (fallback, без ключа)
+# ─────────────────────────────────────────────
+
+COBALT_API = "https://api.cobalt.tools/"
+COBALT_HEADERS = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+}
+
+
+def _http_download_file(dl_url: str, dest: str) -> bool:
+    """Скачивает файл по URL в dest. Возвращает True при успехе."""
+    try:
+        req = urllib.request.Request(
+            dl_url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                )
+            },
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as f:
+            while True:
+                chunk = resp.read(1024 * 256)
+                if not chunk:
+                    break
+                f.write(chunk)
+        size = os.path.getsize(dest)
+        if size == 0:
+            logging.warning(f"[cobalt] скачан пустой файл: {dest}")
+            return False
+        if size > MAX_FILE_SIZE:
+            logging.warning(f"[cobalt] файл слишком большой ({size}): {dest}")
+            return False
+        return True
+    except Exception as e:
+        logging.warning(f"[cobalt] ошибка скачивания {dl_url}: {e}")
+        return False
+
+
+def _guess_ext_from_url(url: str) -> str:
+    """Пытается угадать расширение из URL, по умолчанию mp4."""
+    url_path = url.split("?")[0].lower()
+    for ext in (".mp4", ".mov", ".webm", ".mkv", ".jpg", ".jpeg", ".png", ".webp"):
+        if url_path.endswith(ext):
+            return ext
+    return ".mp4"
+
+
+def _cobalt_request(url: str) -> dict | None:
+    """Синхронный POST к cobalt API. Возвращает JSON или None."""
+    import json as _json
+    payload = _json.dumps({
+        "url": url,
+        "videoQuality": "1080",
+        "downloadMode": "auto",
+        "filenameStyle": "basic",
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            COBALT_API,
+            data=payload,
+            headers=COBALT_HEADERS,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return _json.loads(resp.read())
+    except Exception as e:
+        logging.warning(f"[cobalt] API запрос не удался: {e}")
+        return None
+
+
+async def _download_cobalt(url: str) -> tuple[list[str], str]:
+    """Скачивает медиа через cobalt.tools. Возвращает (файлы, tmpdir)."""
+    tmpdir = tempfile.mkdtemp()
+    loop = asyncio.get_event_loop()
+
+    data = await loop.run_in_executor(None, _cobalt_request, url)
+    if not data:
+        return [], tmpdir
+
+    status = data.get("status", "")
+    logging.info(f"[cobalt] статус: {status}, ответ: {str(data)[:200]}")
+
+    download_urls: list[tuple[str, str]] = []  # (dl_url, filename)
+
+    if status in ("tunnel", "redirect"):
+        dl_url = data.get("url") or data.get("tunnel")
+        if dl_url:
+            ext = _guess_ext_from_url(dl_url)
+            download_urls.append((dl_url, f"001{ext}"))
+
+    elif status == "picker":
+        for i, item in enumerate(data.get("picker", []), 1):
+            item_url = item.get("url") or item.get("tunnel")
+            if item_url:
+                ext = _guess_ext_from_url(item_url)
+                download_urls.append((item_url, f"{i:03d}{ext}"))
+
+    else:
+        err = data.get("error", {})
+        logging.warning(f"[cobalt] неизвестный статус или ошибка: {status} / {err}")
+        return [], tmpdir
+
+    if not download_urls:
+        return [], tmpdir
+
+    # Скачиваем все файлы параллельно через executor
+    def _download_all():
+        results = []
+        for dl_url, fname in download_urls:
+            dest = os.path.join(tmpdir, fname)
+            ok = _http_download_file(dl_url, dest)
+            if ok:
+                results.append(dest)
+        return results
+
+    downloaded = await loop.run_in_executor(None, _download_all)
+    files = [f for f in downloaded if os.path.exists(f) and os.path.getsize(f) > 0]
+    return files, tmpdir
+
+
+# ─────────────────────────────────────────────
+#  Основная функция скачивания (с fallback)
+# ─────────────────────────────────────────────
+
+async def download_media(url: str) -> tuple[list[str], str]:
+    """
+    Пробует yt-dlp, при неудаче — cobalt.tools.
+    Возвращает (список файлов, tmpdir). Caller отвечает за удаление tmpdir.
+    """
+    # Попытка 1: yt-dlp
+    logging.info(f"[save] yt-dlp: {url}")
+    files, tmpdir = await _download_ytdlp(url)
+    if files:
+        logging.info(f"[save] yt-dlp успех: {len(files)} файл(ов)")
+        return files, tmpdir
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    logging.info(f"[save] yt-dlp не дал файлов, пробуем cobalt.tools")
+
+    # Попытка 2: cobalt.tools
+    files, tmpdir = await _download_cobalt(url)
+    if files:
+        logging.info(f"[save] cobalt успех: {len(files)} файл(ов)")
+    else:
+        logging.warning(f"[save] оба способа не дали файлов для {url}")
     return files, tmpdir
 
 
@@ -234,10 +391,6 @@ async def _do_download_and_send(
     bc_id: str,
     cleanup_msg_ids: list[int],
 ):
-    """
-    Sends loading -> downloads -> sends media -> deletes loading + cleanup_msg_ids.
-    On failure, still cleans up loading and shows temp error.
-    """
     loading_msg_id = None
     try:
         sent = await bot.send_message(
@@ -268,7 +421,6 @@ async def _do_download_and_send(
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-    # Удаляем служебное и команду ТОЛЬКО после успешной отправки.
     to_delete: list[int] = []
     if loading_msg_id:
         to_delete.append(loading_msg_id)
