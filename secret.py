@@ -78,6 +78,10 @@ async def _resolve_target(bot: Bot, raw: str) -> tuple[int | None, str]:
     if not raw:
         return None, "не указан получатель"
 
+    # Убираем @ если он стоит перед числом (@123456 → 123456)
+    if raw.startswith("@") and raw[1:].lstrip("-").isdigit():
+        raw = raw[1:]
+
     if raw.lstrip("-").isdigit():
         uid = int(raw)
         # Быстрый путь: пользователь есть в словаре подключённых
