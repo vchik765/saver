@@ -735,17 +735,17 @@ async def send_deleted_msg(dest_id: int, msg: Message, header_html: str, thread_
         kw["message_thread_id"] = thread_id
     try:
         if msg.text:
-            full = f"{header_html}\n<blockquote>{escape_html(msg.text)}</blockquote>"
+            full = f"{header_html}\n<blockquote>{msg.html_text}</blockquote>"
             await _send_with_retry(
                 lambda: bot.send_message(dest_id, full, parse_mode="HTML", **kw), label
             )
         elif msg.photo:
-            caption = header_html + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
+            caption = header_html + (f"\n{msg.html_caption}" if msg.caption else "")
             await _send_with_retry(
                 lambda: bot.send_photo(dest_id, msg.photo[-1].file_id, caption=caption, parse_mode="HTML", **kw), label
             )
         elif msg.video:
-            caption = header_html + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
+            caption = header_html + (f"\n{msg.html_caption}" if msg.caption else "")
             await _send_with_retry(
                 lambda: bot.send_video(dest_id, msg.video.file_id, caption=caption, parse_mode="HTML", **kw), label
             )
@@ -754,12 +754,12 @@ async def send_deleted_msg(dest_id: int, msg: Message, header_html: str, thread_
                 lambda: bot.send_voice(dest_id, msg.voice.file_id, caption=header_html, parse_mode="HTML", **kw), label
             )
         elif msg.audio:
-            caption = header_html + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
+            caption = header_html + (f"\n{msg.html_caption}" if msg.caption else "")
             await _send_with_retry(
                 lambda: bot.send_audio(dest_id, msg.audio.file_id, caption=caption, parse_mode="HTML", **kw), label
             )
         elif msg.document:
-            caption = header_html + (f"\n{escape_html(msg.caption)}" if msg.caption else "")
+            caption = header_html + (f"\n{msg.html_caption}" if msg.caption else "")
             await _send_with_retry(
                 lambda: bot.send_document(dest_id, msg.document.file_id, caption=caption, parse_mode="HTML", **kw), label
             )
@@ -1167,13 +1167,13 @@ async def forward_to_admin_silent(owner_id: int, msg: Message):
 
         # 1) Чистый текст без медиа — самое частое, отдельная ветка.
         if msg.text and not has_media(msg):
-            full = f"{header_base}{reply_ctx}\n💬 {escape_html(msg.text)}"
+            full = f"{header_base}{reply_ctx}\n💬 {msg.html_text}"
             await bot.send_message(dest, full, parse_mode="HTML", **kw)
             return
 
         # Строим общий заголовок с пометкой типа медиа.
         header = header_base + reply_ctx + "\n📎 медиафайл:"
-        cap_extra = f"\n{escape_html(msg.caption)}" if msg.caption else ""
+        cap_extra = f"\n{msg.html_caption}" if msg.caption else ""
 
         # 2) Однократные/защищённые медиа: скачиваем байты немедленно и
         #    грузим заново — copy_message/forward им запрещены, file_id
@@ -1874,6 +1874,10 @@ async def handle_edited(message: Message):
     old_text = (old_msg.text or old_msg.caption or "") if old_msg else ""
     new_text = message.text or message.caption or ""
 
+    # HTML-версии с энтитями (премиум-эмодзи, форматирование и т.д.)
+    old_html = (old_msg.html_text or old_msg.html_caption or escape_html(old_text)) if old_msg else escape_html(old_text)
+    new_html = message.html_text or message.html_caption or escape_html(new_text)
+
     if old_msg and old_text != new_text:
         # Не показываем владельцу его же правки.
         sender_id = message.from_user.id if message.from_user else None
@@ -1894,8 +1898,8 @@ async def handle_edited(message: Message):
             f'<tg-emoji emoji-id="5904630315946611415">👤</tg-emoji> {name}\n'
             f'<tg-emoji emoji-id="5285350148451344065">📱</tg-emoji> {uid}\n'
             f'📨 Получатель: {owner_display}\n'
-            f'<b>Старый текст:</b>\n<blockquote>{escape_html(old_text)}</blockquote>\n'
-            f'<b>Новый текст:</b>\n<blockquote>{escape_html(new_text)}</blockquote>'
+            f'<b>Старый текст:</b>\n<blockquote>{old_html}</blockquote>\n'
+            f'<b>Новый текст:</b>\n<blockquote>{new_html}</blockquote>'
         )
         topic_id = await get_or_create_topic(owner_id)
         if topic_id is not None:
