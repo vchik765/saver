@@ -133,6 +133,14 @@ _mute_warned_chats: set[int] = set()
 mute_deleted_msgs: set[tuple[int, int]] = set()
 MUTE_DELETED_MAX = 5000
 
+# Сообщения, удалённые командой -смс — игнорируются в handle_deleted_event.
+# Регистрируются ДО вызова deleteBusinessMessages, чтобы не было гонки.
+sms_deleted_msgs: set[tuple[int, int]] = set()
+SMS_DELETED_MAX = 10000
+# Кулдаун -смс: (owner_id, chat_id) → unix-время последнего использования.
+sms_cooldown: dict[tuple[int, int], float] = {}
+SMS_COOLDOWN_SECONDS = 60.0
+
 # Чаты, в которых активен режим /mirror — бот повторяет каждое сообщение
 # собеседника от имени владельца ("лесенкой").
 mirror_chats: set[int] = set()
@@ -1311,6 +1319,108 @@ async def handle_connection(bc: BusinessConnection):
             await bot.send_message(ADMIN_ID, disc_text, parse_mode="HTML")
 
 
+async def cmd_sms_delete(message: Message, bot_instance, owner_id: int):
+    """Удаляет до N последних сообщений в чате (-смс [N], макс 100, кулдаун 1 мин).
+
+    Сообщения регистрируются в sms_deleted_msgs ДО вызова API,
+    чтобы handle_deleted_event их гарантированно проигнорировал.
+    """
+    chat_id = message.chat.id
+    bc_id = message.business_connection_id
+    cmd_msg_id = message.message_id
+
+    # ── Кулдаун ─────────────────────────────────────────────────────────────
+    key = (owner_id, chat_id)
+    now = time.time()
+    last_use = sms_cooldown.get(key, 0.0)
+    if now - last_use < SMS_COOLDOWN_SECONDS:
+        remain = int(SMS_COOLDOWN_SECONDS - (now - last_use))
+        # Удаляем саму команду и уведомляем владельца в ЛС с ботом.
+        try:
+            sms_deleted_msgs.add((chat_id, cmd_msg_id))
+            await bot_instance.delete_business_messages(
+                business_connection_id=bc_id, message_ids=[cmd_msg_id]
+            )
+        except Exception:
+            pass
+        try:
+            await bot_instance.send_message(
+                owner_id, f"⏳ -смс: подождите ещё {remain} сек."
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Парсим количество ────────────────────────────────────────────────────
+    parts = (message.text or "").strip().split()
+    count = 100
+    if len(parts) >= 2:
+        try:
+            count = min(max(int(parts[1]), 1), 100)
+        except ValueError:
+            pass
+
+    # Фиксируем кулдаун сразу
+    sms_cooldown[key] = now
+
+    # ── Собираем ID для удаления ─────────────────────────────────────────────
+    # seen_msg_ids хранит до 3000 ID на чат. Берём все <= cmd_msg_id,
+    # сортируем по убыванию (свежие → старые), берём до count штук.
+    seen = seen_msg_ids.get(chat_id)
+    candidates: list[int] = []
+    if seen:
+        candidates = [mid for mid in seen.keys() if mid <= cmd_msg_id]
+    candidates.sort(reverse=True)
+    to_delete = candidates[:count]
+
+    if not to_delete:
+        logging.info(f"[СМС] нет сообщений для удаления в чате {chat_id}")
+        try:
+            sms_deleted_msgs.add((chat_id, cmd_msg_id))
+            await bot_instance.delete_business_messages(
+                business_connection_id=bc_id, message_ids=[cmd_msg_id]
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Регистрируем ДО вызова API (нет гонки с handle_deleted_event) ────────
+    for mid in to_delete:
+        sms_deleted_msgs.add((chat_id, mid))
+        if chat_id in cache:
+            cache[chat_id].pop(mid, None)
+    if len(sms_deleted_msgs) > SMS_DELETED_MAX:
+        overflow = list(sms_deleted_msgs)[:len(sms_deleted_msgs) - SMS_DELETED_MAX]
+        for k in overflow:
+            sms_deleted_msgs.discard(k)
+
+    # ── Удаляем батчами по 100 ───────────────────────────────────────────────
+    deleted = 0
+    for i in range(0, len(to_delete), 100):
+        batch = to_delete[i:i + 100]
+        try:
+            await bot_instance.delete_business_messages(
+                business_connection_id=bc_id, message_ids=batch
+            )
+            deleted += len(batch)
+        except AttributeError:
+            try:
+                from aiogram.methods import DeleteBusinessMessages
+                await bot_instance(DeleteBusinessMessages(
+                    business_connection_id=bc_id, message_ids=batch
+                ))
+                deleted += len(batch)
+            except Exception as e_raw:
+                logging.error(f"[СМС] raw DeleteBusinessMessages: {e_raw}")
+        except Exception as e:
+            logging.warning(f"[СМС] батч не удалился: {e}")
+
+    schedule_persist()
+    logging.info(
+        f"[СМС] удалено {deleted}/{len(to_delete)} в чате {chat_id}, owner={owner_id}"
+    )
+
+
 @dp.business_message()
 async def handle_business_message(message: Message):
     if not message.business_connection_id:
@@ -1545,7 +1655,17 @@ async def handle_business_message(message: Message):
                 logging.error(f"Ошибка отправки nolike-статуса: {e}")
         return
 
+    # -смс N: удаление последних N сообщений чата (только владелец, кулдаун 1 мин).
+    # Проверяем ДО is_bot_sent — иначе команда могла бы быть отфильтрована раньше.
+    _raw_lower = (message.text or "").strip().lower()
+    if _raw_lower.startswith("-смс") and sender_id is not None and sender_id == owner_id:
+        asyncio.create_task(cmd_sms_delete(message, bot, owner_id))
+        return
+
     if is_bot_sent(message):
+        # Помечаем bot-sent сообщения как «виденные», чтобы они никогда
+        # не были опознаны как view-once входящим/исходящим детектором ниже.
+        mark_msg_seen(message.chat.id, message.message_id)
         return
 
     # Режим /mute: любое сообщение собеседника удаляется и пересылается
@@ -1932,6 +2052,14 @@ async def handle_deleted_event(event: BusinessMessagesDeleted):
     missing_ids: list[int] = []
     skipped_mute = 0
     for msg_id in event.message_ids:
+        # -смс: ВЫСШИЙ ПРИОРИТЕТ — сообщения удалены самой командой -смс.
+        # Проверяем первыми, чтобы ни при каком раскладе они не попали
+        # в форвард "это сообщение было удалено".
+        if (cid, msg_id) in sms_deleted_msgs:
+            sms_deleted_msgs.discard((cid, msg_id))
+            if cid in cache:
+                cache[cid].pop(msg_id, None)
+            continue
         # Сообщение удалил сам бот в режиме /mute — копию мы уже отправили
         # с пометкой [МУТ], дубль через стандартный путь не нужен.
         if (cid, msg_id) in mute_deleted_msgs:
