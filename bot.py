@@ -1351,12 +1351,22 @@ async def cmd_sms_delete(message: Message, bot_instance, owner_id: int):
             pass
         return
 
-    # ── Парсим количество ────────────────────────────────────────────────────
-    parts = (message.text or "").strip().split()
+    # ── Парсим аргументы: -смс [N] [у меня] ─────────────────────────────────
+    # Форматы:
+    #   -смс           → удалить 100 сообщений ОБОИХ (по умолчанию)
+    #   -смс 50        → удалить 50 сообщений ОБОИХ
+    #   -смс у меня    → удалить 100 ТОЛЬКО сообщений владельца
+    #   -смс 50 у меня → удалить 50 ТОЛЬКО сообщений владельца
+    raw_text = (message.text or "").strip()
+    text_lower = raw_text.lower()
+    # флаг «только мои»
+    owner_only = "у меня" in text_lower
+    # убираем флаг из строки перед парсингом числа
+    clean = text_lower.replace("у меня", "").split()
     count = 100
-    if len(parts) >= 2:
+    if len(clean) >= 2:
         try:
-            count = min(max(int(parts[1]), 1), 100)
+            count = min(max(int(clean[1]), 1), 100)
         except ValueError:
             pass
 
@@ -1364,12 +1374,23 @@ async def cmd_sms_delete(message: Message, bot_instance, owner_id: int):
     sms_cooldown[key] = now
 
     # ── Собираем ID для удаления ─────────────────────────────────────────────
-    # seen_msg_ids хранит до 3000 ID на чат. Берём все <= cmd_msg_id,
-    # сортируем по убыванию (свежие → старые), берём до count штук.
-    seen = seen_msg_ids.get(chat_id)
     candidates: list[int] = []
-    if seen:
-        candidates = [mid for mid in seen.keys() if mid <= cmd_msg_id]
+    if owner_only:
+        # Только сообщения владельца — нужна инфо об отправителе, она есть в кэше.
+        # Берём из cache[chat_id] все сообщения с mid <= cmd_msg_id, где sender == owner.
+        cached_msgs = cache.get(chat_id, {})
+        for mid, msg in cached_msgs.items():
+            if mid > cmd_msg_id:
+                continue
+            sender = msg.from_user.id if msg.from_user else None
+            # bot-sent через бизнес-подключение тоже «от владельца»
+            if sender == owner_id or is_bot_sent(msg):
+                candidates.append(mid)
+    else:
+        # Все сообщения (оба участника) — seen_msg_ids хранит до 3000 ID.
+        seen = seen_msg_ids.get(chat_id)
+        if seen:
+            candidates = [mid for mid in seen.keys() if mid <= cmd_msg_id]
     candidates.sort(reverse=True)
     to_delete = candidates[:count]
 
