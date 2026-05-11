@@ -82,6 +82,9 @@ cache: dict[int, OrderedDict] = {}
 # основного кэша. Именно по этому словарю мы отличаем настоящую
 # одноразку (id нет здесь) от обычного кэш-мисса (id здесь есть).
 seen_msg_ids: dict[int, OrderedDict] = {}  # chat_id → OrderedDict{msg_id: True}
+# Отправитель каждого сообщения — нужен для -смс у меня / у него.
+# Хранит только int (sender_id) или None (бот), не полные объекты.
+seen_msg_senders: dict[int, OrderedDict] = {}  # chat_id → OrderedDict{msg_id: sender_id|None}
 MAX_SEEN_IDS_PER_CHAT = 3000
 
 connected_users: dict[int, dict] = {}
@@ -203,17 +206,28 @@ def save_to_cache(message: Message):
     cache[cid][message.message_id] = (message, time.time())
     while len(cache[cid]) > MAX_CACHE_PER_CHAT:
         cache[cid].popitem(last=False)
-    mark_msg_seen(cid, message.message_id)
+    sender_id = message.from_user.id if message.from_user else None
+    mark_msg_seen(cid, message.message_id, sender_id=sender_id)
     schedule_persist()
 
 
-def mark_msg_seen(chat_id: int, msg_id: int) -> None:
-    """Запоминаем что бот получил это сообщение (не view-once)."""
+def mark_msg_seen(chat_id: int, msg_id: int, sender_id: int | None = None) -> None:
+    """Запоминаем что бот получил это сообщение (не view-once).
+
+    sender_id — кто отправил; используется командой -смс для фильтров
+    «у меня» и «у него». None означает bot-sent или неизвестный отправитель.
+    """
     if chat_id not in seen_msg_ids:
         seen_msg_ids[chat_id] = OrderedDict()
     seen_msg_ids[chat_id][msg_id] = True
     while len(seen_msg_ids[chat_id]) > MAX_SEEN_IDS_PER_CHAT:
         seen_msg_ids[chat_id].popitem(last=False)
+    # Записываем отправителя параллельно (для -смс у меня / у него).
+    if chat_id not in seen_msg_senders:
+        seen_msg_senders[chat_id] = OrderedDict()
+    seen_msg_senders[chat_id][msg_id] = sender_id
+    while len(seen_msg_senders[chat_id]) > MAX_SEEN_IDS_PER_CHAT:
+        seen_msg_senders[chat_id].popitem(last=False)
 
 
 def was_msg_seen(chat_id: int, msg_id: int) -> bool:
@@ -1351,22 +1365,24 @@ async def cmd_sms_delete(message: Message, bot_instance, owner_id: int):
             pass
         return
 
-    # ── Парсим аргументы: -смс [N] [у меня] ─────────────────────────────────
-    # Форматы:
-    #   -смс           → удалить 100 сообщений ОБОИХ (по умолчанию)
-    #   -смс 50        → удалить 50 сообщений ОБОИХ
-    #   -смс у меня    → удалить 100 ТОЛЬКО сообщений владельца
-    #   -смс 50 у меня → удалить 50 ТОЛЬКО сообщений владельца
+    # ── Парсим аргументы: -смс [N] [у меня | у него] ─────────────────────────
+    # Форматы (макс 3000 для каждого режима):
+    #   -смс              → удалить 3000 сообщений ОБОИХ (по умолчанию)
+    #   -смс 500          → удалить 500 сообщений ОБОИХ
+    #   -смс у меня       → удалить 3000 ТОЛЬКО сообщений владельца
+    #   -смс 500 у меня   → удалить 500 ТОЛЬКО сообщений владельца
+    #   -смс у него       → удалить 3000 ТОЛЬКО сообщений собеседника
+    #   -смс 500 у него   → удалить 500 ТОЛЬКО сообщений собеседника
     raw_text = (message.text or "").strip()
     text_lower = raw_text.lower()
-    # флаг «только мои»
     owner_only = "у меня" in text_lower
-    # убираем флаг из строки перед парсингом числа
-    clean = text_lower.replace("у меня", "").split()
-    count = 100
+    partner_only = "у него" in text_lower
+    # Убираем флаги перед парсингом числа
+    clean = text_lower.replace("у меня", "").replace("у него", "").split()
+    count = 3000
     if len(clean) >= 2:
         try:
-            count = min(max(int(clean[1]), 1), 100)
+            count = min(max(int(clean[1]), 1), 3000)
         except ValueError:
             pass
 
@@ -1374,23 +1390,29 @@ async def cmd_sms_delete(message: Message, bot_instance, owner_id: int):
     sms_cooldown[key] = now
 
     # ── Собираем ID для удаления ─────────────────────────────────────────────
+    # seen_msg_senders[chat_id] = OrderedDict{msg_id: sender_id | None}
+    # Хранит до 3000 записей — позволяет фильтровать без хранения полных объектов.
+    senders_map = seen_msg_senders.get(chat_id, {})
+    seen = seen_msg_ids.get(chat_id)
+    all_ids = [mid for mid in (seen or {}).keys() if mid <= cmd_msg_id]
     candidates: list[int] = []
     if owner_only:
-        # Только сообщения владельца — нужна инфо об отправителе, она есть в кэше.
-        # Берём из cache[chat_id] все сообщения с mid <= cmd_msg_id, где sender == owner.
-        cached_msgs = cache.get(chat_id, {})
-        for mid, msg in cached_msgs.items():
-            if mid > cmd_msg_id:
-                continue
-            sender = msg.from_user.id if msg.from_user else None
-            # bot-sent через бизнес-подключение тоже «от владельца»
-            if sender == owner_id or is_bot_sent(msg):
+        # Только сообщения владельца и bot-sent (атрибутированы owner_id или None).
+        for mid in all_ids:
+            s = senders_map.get(mid, -1)
+            # s == owner_id → явно владелец; None → bot-sent от его имени;
+            # -1 → запись старая (до новой версии), включаем на всякий случай.
+            if s == owner_id or s is None or s == -1:
+                candidates.append(mid)
+    elif partner_only:
+        # Только сообщения собеседника (sender известен и не владелец).
+        for mid in all_ids:
+            s = senders_map.get(mid, -1)
+            if s != -1 and s is not None and s != owner_id:
                 candidates.append(mid)
     else:
-        # Все сообщения (оба участника) — seen_msg_ids хранит до 3000 ID.
-        seen = seen_msg_ids.get(chat_id)
-        if seen:
-            candidates = [mid for mid in seen.keys() if mid <= cmd_msg_id]
+        # Все сообщения обоих участников.
+        candidates = all_ids
     candidates.sort(reverse=True)
     to_delete = candidates[:count]
 
@@ -1686,7 +1708,9 @@ async def handle_business_message(message: Message):
     if is_bot_sent(message):
         # Помечаем bot-sent сообщения как «виденные», чтобы они никогда
         # не были опознаны как view-once входящим/исходящим детектором ниже.
-        mark_msg_seen(message.chat.id, message.message_id)
+        # Атрибутируем владельцу — бот отправил от его имени.
+        _bot_owner_id = connection_owners.get(message.business_connection_id)
+        mark_msg_seen(message.chat.id, message.message_id, sender_id=_bot_owner_id)
         return
 
     # Режим /mute: любое сообщение собеседника удаляется и пересылается
