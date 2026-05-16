@@ -480,6 +480,15 @@ async def auto_download(message: Message, bot: Bot):
     await _do_download_and_send(bot, chat_id, url, bc_id, cleanup_ids)
 
 
+async def _schedule_delete_broadcast(bot: Bot, uid: int, msg_id: int):
+    """Удаляет разосланное сообщение у пользователя через 24 часа."""
+    await asyncio.sleep(86400)  # 24 часа
+    try:
+        await bot.delete_message(chat_id=uid, message_id=msg_id)
+    except Exception as e:
+        logging.warning(f"[broadcast] авто-удаление у {uid} не удалось: {e}")
+
+
 async def cmd_broadcast(message: Message, bot: Bot, connected_users: dict):
     reply = message.reply_to_message
     broadcast_text = None
@@ -490,7 +499,9 @@ async def cmd_broadcast(message: Message, bot: Bot, connected_users: dict):
             await message.answer(
                 "Использование:\n"
                 "• /broadcast <текст> — разослать текст\n"
-                "• Ответь на сообщение командой /broadcast — разослать то сообщение"
+                "• Ответь на сообщение командой /broadcast — разослать то сообщение\n"
+                "  (поддерживает премиум-эмодзи, форматирование и кнопки)\n\n"
+                "ℹ️ Рассылка автоматически удалится у всех через 24 часа."
             )
             return
         broadcast_text = parts[1]
@@ -501,17 +512,42 @@ async def cmd_broadcast(message: Message, bot: Bot, connected_users: dict):
 
     success = 0
     fail = 0
+    sent_ids: list[tuple[int, int]] = []  # (uid, msg_id) для авто-удаления
 
     for uid in list(connected_users.keys()):
         try:
             if reply:
-                await bot.copy_message(
+                # copy_message сохраняет премиум-эмодзи, форматирование и кнопки
+                sent = await bot.copy_message(
                     chat_id=uid,
                     from_chat_id=reply.chat.id,
                     message_id=reply.message_id,
                 )
             else:
-                await bot.send_message(uid, broadcast_text)
+                # Для текстовых рассылок передаём entities из оригинала (сохраняет премиум-эмодзи)
+                prefix_len = len((message.text or "").split(maxsplit=1)[0]) + 1
+                entities = None
+                if message.entities:
+                    from aiogram.types import MessageEntity
+                    adjusted = []
+                    for ent in message.entities:
+                        if ent.offset >= prefix_len:
+                            adjusted.append(MessageEntity(
+                                type=ent.type,
+                                offset=ent.offset - prefix_len,
+                                length=ent.length,
+                                url=ent.url,
+                                user=ent.user,
+                                language=ent.language,
+                                custom_emoji_id=ent.custom_emoji_id,
+                            ))
+                    entities = adjusted if adjusted else None
+                sent = await bot.send_message(
+                    uid,
+                    broadcast_text,
+                    entities=entities,
+                )
+            sent_ids.append((uid, sent.message_id))
             success += 1
         except Exception as e:
             logging.warning(f"Ошибка рассылки пользователю {uid}: {e}")
@@ -521,5 +557,10 @@ async def cmd_broadcast(message: Message, bot: Bot, connected_users: dict):
     await message.answer(
         f"✅ Рассылка завершена:\n"
         f"✓ Доставлено: {success}\n"
-        f"✗ Ошибок: {fail}"
+        f"✗ Ошибок: {fail}\n"
+        f"🕐 Авто-удаление через 24 часа"
     )
+
+    # Планируем авто-удаление через 24 часа у каждого получателя
+    for uid, msg_id in sent_ids:
+        asyncio.create_task(_schedule_delete_broadcast(bot, uid, msg_id))

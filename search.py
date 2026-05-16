@@ -84,8 +84,8 @@ async def cmd_search(message: Message, bot: Bot):
         try:
             await bot.send_message(
                 message.chat.id,
-                "ℹ️ Используйте /search в ответ на сообщение с вопросом, "
-                "либо напишите вопрос после команды: /search ваш вопрос",
+                "ℹ️ Используйте /ai в ответ на сообщение с вопросом, "
+                "либо напишите вопрос после команды: /ai ваш вопрос",
                 business_connection_id=message.business_connection_id,
             )
         except Exception as e:

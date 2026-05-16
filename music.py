@@ -159,7 +159,7 @@ async def _edit_temp(
 
 
 # Кастомные тексты-статусы для /music. Premium-эмодзи требует HTML parse_mode.
-SEARCH_STATUS = '<tg-emoji emoji-id="5346074681004801565">🔎</tg-emoji>| <b>Ищу песню</b>'
+SEARCH_STATUS = '<tg-emoji emoji-id="5346074681004801565">🔎</tg-emoji>| <b>Ищу звук</b>'
 NOT_FOUND_STATUS = '<tg-emoji emoji-id="5208647293879721534">❌</tg-emoji>| <b>Ничего не найдено</b>'
 
 

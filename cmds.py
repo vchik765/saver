@@ -195,9 +195,11 @@ async def cmd_ignore(message: Message, bot: Bot, ignore_chats: set):
 async def cmd_mirror(message: Message, bot: Bot, mirror_chats: set):
     """Включает режим зеркала: бот будет повторять сообщения собеседника
     от имени владельца. Удаление команды — в bot.py приоритетно.
+    Ключ (owner_id, chat_id) добавляется в bot.py до вызова этой функции.
     Останавливается командой /stop.
     """
-    mirror_chats.add(message.chat.id)
+    # mirror_chats уже обновлён в bot.py (с ключом (owner_id, chat_id)).
+    pass
 
 
 async def cmd_mute(message: Message, bot: Bot, muted_chats: set):
