@@ -2437,7 +2437,7 @@ async def handle_save_pm(message: Message):
     await cmd_save(message, bot)
 
 
-@dp.message(F.chat.type == "private", Command(["sound", "music"]))
+@dp.message(F.chat.type == "private", Command("sound", "music"))
 async def handle_music_pm(message: Message):
     if message.from_user and message.from_user.id in banned_users:
         return
