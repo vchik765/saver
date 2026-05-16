@@ -356,6 +356,8 @@ _GH_REPO   = os.getenv("GITHUB_REPO", "vchik765/saver")
 _GH_BRANCH = os.getenv("GITHUB_BRANCH", "main")
 _GH_PATH   = ".bot_state/state.json"
 _GH_API    = f"https://api.github.com/repos/{_GH_REPO}/contents/{_GH_PATH}"
+_GH_CACHE_PATH = ".bot_state/cache.jsonl"
+_GH_CACHE_API  = f"https://api.github.com/repos/{_GH_REPO}/contents/{_GH_CACHE_PATH}"
 _gh_save_lock = asyncio.Lock()
 
 
@@ -440,6 +442,82 @@ def _gh_save_state_sync() -> bool:
     return False
 
 
+
+def _gh_save_cache_sync() -> bool:
+    """Синхронно сохраняет кэш сообщений в GitHub (.bot_state/cache.jsonl).
+    Сохраняет только сообщения не старше 24 часов, макс 30 на чат."""
+    if not _GH_TOKEN:
+        return False
+    now = time.time()
+    cutoff = now - 86400  # 24 часа
+    lines = []
+    for cid, chat_cache in cache.items():
+        items = [(mid, msg, ts) for mid, (msg, ts) in chat_cache.items() if ts > cutoff]
+        for mid, msg, ts in items[-30:]:
+            try:
+                lines.append(json.dumps({
+                    "cid": cid, "mid": mid, "ts": ts,
+                    "msg": msg.model_dump_json(exclude_none=True),
+                }, ensure_ascii=False))
+            except Exception:
+                continue
+    if not lines:
+        return True
+    content_str = "
+".join(lines)
+    cur = _gh_request("GET", f"{_GH_CACHE_API}?ref={_GH_BRANCH}")
+    sha_cur = cur.get("sha")
+    body: dict = {
+        "message": "[bot-cache] auto-save cache.jsonl",
+        "content": base64.b64encode(content_str.encode()).decode(),
+        "branch":  _GH_BRANCH,
+    }
+    if sha_cur:
+        body["sha"] = sha_cur
+    resp = _gh_request("PUT", _GH_CACHE_API, body)
+    if "commit" in resp:
+        logging.info(f"[GH-CACHE] сохранено {len(lines)} сообщений в GitHub")
+        return True
+    logging.error(f"[GH-CACHE] не удалось сохранить кэш: {resp}")
+    return False
+
+
+def _gh_load_cache_sync() -> int:
+    """Синхронно загружает кэш из GitHub. Возвращает количество загруженных сообщений."""
+    if not _GH_TOKEN:
+        return 0
+    resp = _gh_request("GET", f"{_GH_CACHE_API}?ref={_GH_BRANCH}")
+    if "_status" in resp or "_error" in resp:
+        if resp.get("_status") != 404:
+            logging.warning(f"[GH-CACHE] загрузка не удалась: {resp}")
+        return 0
+    try:
+        raw = base64.b64decode(resp["content"].replace("
+", "")).decode("utf-8")
+        loaded = 0
+        for line in raw.split("
+"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                msg = Message.model_validate_json(entry["msg"])
+                cid = int(entry["cid"])
+                mid = int(entry["mid"])
+                ts  = float(entry["ts"])
+                if cid not in cache:
+                    cache[cid] = OrderedDict()
+                cache[cid][mid] = (msg, ts)
+                loaded += 1
+            except Exception:
+                continue
+        logging.info(f"[GH-CACHE] загружено {loaded} сообщений из GitHub")
+        return loaded
+    except Exception as e:
+        logging.warning(f"[GH-CACHE] распарсить не удалось: {e}")
+        return 0
+
 async def github_persist_loop():
     """Фоновая задача: раз в 10 мин сохраняет state в GitHub-репо.
     Это гарантирует что owner_topics и всё остальное переживут
@@ -450,6 +528,7 @@ async def github_persist_loop():
         async with _gh_save_lock:
             try:
                 await asyncio.get_event_loop().run_in_executor(None, _gh_save_state_sync)
+                await asyncio.get_event_loop().run_in_executor(None, _gh_save_cache_sync)
             except Exception as e:
                 logging.error(f"[GH-STATE] ошибка в цикле: {e}")
         await asyncio.sleep(600)  # 10 минут
@@ -619,6 +698,12 @@ def load_persistent_state():
             logging.info(f"Сообщений загружено из кэша: {loaded} в {len(cache)} чатах")
         except Exception as e:
             logging.error(f"Ошибка загрузки кэша: {e}")
+
+    # Если кэш на диске пуст (Railway стёр ФС при деплое) — восстанавливаем из GitHub.
+    total_cached = sum(len(v) for v in cache.values())
+    if total_cached == 0:
+        logging.info("[GH-CACHE] локальный кэш пуст, восстанавливаем из GitHub...")
+        _gh_load_cache_sync()
 
 
 def get_cached_message(chat_id: int, msg_id: int) -> Message | None:
