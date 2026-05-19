@@ -210,13 +210,18 @@ def setup_passive_handler(app: Client):
 def setup_manual_handler(app: Client):
 
     @app.on_message(
-        filters.regex(r"^\.собрать$") & filters.group & filters.me
+        filters.regex(r"^\.собрать(?:\s+(\d+))?$") & filters.group & filters.me
     )
     async def handle_manual_collect(client: Client, message: Message):
         chat_id    = message.chat.id
         chat_title = message.chat.title or str(chat_id)
 
-        log.info(f"[.собрать] в группе: {chat_title}")
+        # Парсим лимит из команды: .собрать 2000 → 2000, .собрать → 1000
+        match = message.matches[0] if message.matches else None
+        raw_limit = match.group(1) if match and match.group(1) else None
+        limit = min(int(raw_limit), 5000) if raw_limit else MANUAL_HISTORY_LIMIT
+
+        log.info(f"[.собрать] в группе: {chat_title}, лимит: {limit}")
 
         try:
             await message.delete()
@@ -225,7 +230,7 @@ def setup_manual_handler(app: Client):
 
         status_msg = await client.send_message(
             "me",
-            f"⏳ Листаю последние {MANUAL_HISTORY_LIMIT} сообщений в «{chat_title}»..."
+            f"⏳ Листаю последние {limit} сообщений в «{chat_title}»..."
         )
 
         async with _state_lock:
@@ -233,7 +238,7 @@ def setup_manual_handler(app: Client):
             existing = set(u.lower() for u in state["collected"])
 
             found = await collect_from_history(
-                client, chat_id, existing, limit=MANUAL_HISTORY_LIMIT
+                client, chat_id, existing, limit=limit
             )
 
             if found:
@@ -243,7 +248,7 @@ def setup_manual_handler(app: Client):
                 await client.edit_message_text(
                     "me", status_msg.id,
                     f"✅ «{chat_title[:30]}»\n"
-                    f"Просмотрено: {MANUAL_HISTORY_LIMIT} сообщений\n"
+                    f"Просмотрено: {limit} сообщений\n"
                     f"Новых юзернеймов: {len(found)}\n"
                     f"Всего в базе: {len(state['collected'])}"
                 )
