@@ -6,6 +6,7 @@
   /sound yt <запрос>         — только YouTube
   /sound sc <запрос>         — только SoundCloud
   /sound bc <запрос>         — только Bandcamp
+  /sound dz <запрос>         — только Deezer
   /sound                     — reply на голосовое/аудио/видео: Shazam → поиск
 
 Улучшения v2:
@@ -53,9 +54,10 @@ ITUNES_TIMEOUT      = 6           # сек на нормализацию чер�
 
 # ── Источники ───────────────────────────────────────────────────────
 VK_SOURCE      = "vk:"
-DEFAULT_SOURCES = ("vk:", "ytsearch10:", "scsearch10:", "bcsearch1:")
+DEFAULT_SOURCES = ("vk:", "dzmsearch5:", "ytsearch10:", "scsearch10:", "bcsearch1:")
 SOURCE_LABELS   = {
     "vk:":         "VK",
+    "dzmsearch5:": "Deezer",
     "ytsearch10:": "YouTube",
     "scsearch10:": "SoundCloud",
     "bcsearch1:":  "Bandcamp",
@@ -477,6 +479,8 @@ def _parse_query(text: str) -> tuple[str, tuple[str, ...]]:
         return " ".join(rest[1:]).strip(), ("scsearch1:",)
     if first in ("bc", "bandcamp") and len(rest) > 1:
         return " ".join(rest[1:]).strip(), ("bcsearch1:",)
+    if first in ("dz", "deezer") and len(rest) > 1:
+        return " ".join(rest[1:]).strip(), ("dzmsearch5:",)
     return " ".join(rest).strip(), DEFAULT_SOURCES
 
 
@@ -606,7 +610,7 @@ async def cmd_music(message: Message, bot: Bot):
         tasks_list = [(_src_task(query, p), p) for p in active_sources]
         # Добавляем нормализованный запрос на YouTube и VK
         if normalized_query:
-            for p in ("ytsearch10:", "vk:"):
+            for p in ("ytsearch10:", "dzmsearch5:", "vk:"):
                 if p in active_sources:
                     tasks_list.append((_src_task(normalized_query, p), p + "_norm"))
 
