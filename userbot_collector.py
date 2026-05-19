@@ -324,6 +324,7 @@ async def run_once(app: Client):
 # ══════════════════════════════════════════════════════════════
 
 async def scheduler(app: Client):
+    global _passive_pending
     log.info(f"Планировщик: автосбор каждый день в {RUN_HOUR}:00 UTC ({RUN_HOUR+3}:00 мск)")
     last_run_date = None
     last_flush    = datetime.utcnow()
@@ -342,7 +343,6 @@ async def scheduler(app: Client):
         # Принудительный сброс пассивного буфера раз в час
         if (now - last_flush).seconds >= 3600 and _passive_pending:
             async with _state_lock:
-                global _passive_pending
                 if _passive_pending:
                     to_send = _passive_pending[:]
                     _passive_pending = []
