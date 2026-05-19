@@ -27,6 +27,21 @@ import urllib.parse
 from aiogram import Bot
 from aiogram.types import Message, BufferedInputFile
 
+# ── Нежелательные версии (ремиксы, ускоренные и т.п.) ───────────────
+JUNK_RE = re.compile(
+    r"(?i)("
+    r"remix|sped[\s\-_]?up|speed[\s\-_]?up|nightcore|slowed|reverb(?:ed)?|"
+    r"cover(?:\s+version)?|karaoke|instrumental|tribute|mashup|"
+    r"edit(?:ed)?(?:\s+version)?|"
+    r"live(?:\s+at|\s+from|\s+version)?|concert|acoustic\s+version|"
+    r"orchestral|piano\s+version|ringtone|"
+    r"lyric[s]?\s+video|\blyrics\b|8d\s+audio|bass\s+boost(?:ed)?|"
+    r"phonk(?:\s+version)?|1\s*hour(?:\s+loop)?|[23456789]0\s*minutes?\s+loop|"
+    r"extended\s+mix|radio\s+edit|demo|rehearsal|tiktok|"
+    r"ускоренн|замедленн|слоу|nightcore|кавер"
+    r")"
+)
+
 # ── Лимиты ─────────────────────────────────────────────────────────
 MAX_DURATION_SEC    = 15 * 60
 MAX_OUTPUT_BYTES    = 49 * 1024 * 1024
@@ -38,12 +53,12 @@ ITUNES_TIMEOUT      = 6           # сек на нормализацию чер�
 
 # ── Источники ───────────────────────────────────────────────────────
 VK_SOURCE      = "vk:"
-DEFAULT_SOURCES = ("vk:", "ytsearch1:", "scsearch1:", "bcsearch1:")
+DEFAULT_SOURCES = ("vk:", "ytsearch10:", "scsearch10:", "bcsearch1:")
 SOURCE_LABELS   = {
-    "vk:":        "VK",
-    "ytsearch1:": "YouTube",
-    "scsearch1:": "SoundCloud",
-    "bcsearch1:": "Bandcamp",
+    "vk:":         "VK",
+    "ytsearch10:": "YouTube",
+    "scsearch10:": "SoundCloud",
+    "bcsearch1:":  "Bandcamp",
 }
 
 # ── Статусы (premium-эмодзи) ─────────────────────────────────────────
@@ -287,7 +302,13 @@ async def _try_vk(query: str, tmpdir: str) -> dict | None:
         return None
 
     items = (data.get("response") or {}).get("items") or []
-    track = next((it for it in items if (it.get("url") or "").strip()), None)
+    # Prefer originals — skip remixes/sped-up/etc when possible
+    valid = [it for it in items if (it.get("url") or "").strip()]
+    clean = [
+        it for it in valid
+        if not JUNK_RE.search(f"{it.get('artist', '')} {it.get('title', '')}")
+    ]
+    track = (clean or valid)[0] if (clean or valid) else None
     if not track:
         return None
 
@@ -333,10 +354,19 @@ async def _try_source(query: str, source_prefix: str, tmpdir: str) -> dict | Non
         "-x",
         "--audio-format", "mp3",
         "--audio-quality", "0",
-        "--no-playlist",
         "--no-warnings",
         "--quiet",
         "--no-progress",
+        "--max-downloads", "1",
+        "--reject-title",
+        r"(?i)(remix|sped[\s\-_]?up|speed[\s\-_]?up|nightcore|slowed|reverb(?:ed)?|"
+        r"cover(?:\s+version)?|karaoke|instrumental|tribute|mashup|"
+        r"edit(?:ed)?(?:\s+version)?|live(?:\s+at|\s+from|\s+version)?|concert|"
+        r"acoustic\s+version|orchestral|piano\s+version|ringtone|"
+        r"lyric[s]?\s+video|\blyrics\b|8d\s+audio|bass\s+boost(?:ed)?|"
+        r"phonk(?:\s+version)?|1\s*hour(?:\s+loop)?|extended\s+mix|"
+        r"radio\s+edit|demo|rehearsal|tiktok|"
+        r"ускоренн|замедленн|слоу|кавер)",
         "--max-filesize", str(MAX_OUTPUT_BYTES),
         "--match-filter", f"duration < {MAX_DURATION_SEC}",
         "--print",
@@ -576,7 +606,7 @@ async def cmd_music(message: Message, bot: Bot):
         tasks_list = [(_src_task(query, p), p) for p in active_sources]
         # Добавляем нормализованный запрос на YouTube и VK
         if normalized_query:
-            for p in ("ytsearch1:", "vk:"):
+            for p in ("ytsearch10:", "vk:"):
                 if p in active_sources:
                     tasks_list.append((_src_task(normalized_query, p), p + "_norm"))
 
