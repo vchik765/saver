@@ -463,8 +463,7 @@ def _gh_save_cache_sync() -> bool:
                 continue
     if not lines:
         return True
-    content_str = "
-".join(lines)
+    content_str = "\n".join(lines)
     cur = _gh_request("GET", f"{_GH_CACHE_API}?ref={_GH_BRANCH}")
     sha_cur = cur.get("sha")
     body: dict = {
@@ -492,11 +491,9 @@ def _gh_load_cache_sync() -> int:
             logging.warning(f"[GH-CACHE] загрузка не удалась: {resp}")
         return 0
     try:
-        raw = base64.b64decode(resp["content"].replace("
-", "")).decode("utf-8")
+        raw = base64.b64decode(resp["content"].replace("\n", "")).decode("utf-8")
         loaded = 0
-        for line in raw.split("
-"):
+        for line in raw.split("\n"):
             line = line.strip()
             if not line:
                 continue
