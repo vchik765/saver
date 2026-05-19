@@ -1,23 +1,24 @@
 """Команда /music (/sound) — поиск и отправка музыки из нескольких источников.
 
 Использование:
-  /sound <запрос>            — поиск: Deezer-нормализация + VK + YouTube + SoundCloud + Bandcamp
+  /sound <запрос>            — поиск: VK + YouTube + SoundCloud + Bandcamp
   /sound vk <запрос>         — только VK Музыка
   /sound yt <запрос>         — только YouTube
   /sound sc <запрос>         — только SoundCloud
   /sound bc <запрос>         — только Bandcamp
-  /sound dz <запрос>         — только Deezer
   /sound                     — reply на голосовое/аудио/видео: Shazam → поиск
 
-Улучшения v2:
-  • Deezer API (бесплатно, без ключа) — нормализует запрос перед поиском.
-    Даже если написать "sport miyagi" или "miyagi sport" — найдёт правильно.
-  • iTunes Search API — дополнительный нормализатор для западной музыки.
-  • Bandcamp — новый источник, хорош для инди и нишевой музыки.
-  • Параллельный поиск по оригинальному И нормализованному запросу.
-  • Таймаут увеличен, Bandcamp добавлен в дефолтные источники.
+Логика поиска (v3):
+  • Двухфазный поиск: сначала получаем список кандидатов без скачивания,
+    фильтруем в Python, скачиваем только лучший результат.
+  • Фильтр мусора: ремикс/remix, ускоренн/sped up, nightcore, slowed,
+    кавер/cover, karaoke, instrumental, live version и т.п. — пропускаем.
+    Если всё — мусор, берём первый попавшийся (лучше что-то, чем ничего).
+  • Deezer + iTunes: нормализуют запрос (исправляют порядок слов).
+  • VK: API возвращает 10 кандидатов — фильтруем, выбираем чистый.
 """
 import asyncio
+import json
 import logging
 import os
 import re
@@ -28,36 +29,47 @@ import urllib.parse
 from aiogram import Bot
 from aiogram.types import Message, BufferedInputFile
 
-# ── Нежелательные версии (ремиксы, ускоренные и т.п.) ───────────────
+# ── Фильтр нежелательных версий ─────────────────────────────────────
 JUNK_RE = re.compile(
-    r"(?i)("
-    r"remix|sped[\s\-_]?up|speed[\s\-_]?up|nightcore|slowed|reverb(?:ed)?|"
-    r"cover(?:\s+version)?|karaoke|instrumental|tribute|mashup|"
+    r"(?i)\b("
+    r"remix|ремикс|"
+    r"sped[\s\-_]?up|speed[\s\-_]?up|ускоренн|spedup|"
+    r"nightcore|"
+    r"slowed|замедленн|слоу|"
+    r"reverb(?:ed)?|"
+    r"cover(?:\s+version)?|кавер|"
+    r"karaoke|instrumental|tribute|mashup|"
     r"edit(?:ed)?(?:\s+version)?|"
-    r"live(?:\s+at|\s+from|\s+version)?|concert|acoustic\s+version|"
-    r"orchestral|piano\s+version|ringtone|"
-    r"lyric[s]?\s+video|\blyrics\b|8d\s+audio|bass\s+boost(?:ed)?|"
-    r"phonk(?:\s+version)?|1\s*hour(?:\s+loop)?|[23456789]0\s*minutes?\s+loop|"
-    r"extended\s+mix|radio\s+edit|demo|rehearsal|tiktok|"
-    r"ускоренн|замедленн|слоу|nightcore|кавер"
-    r")"
+    r"live(?:\s+at|\s+from|\s+version)?|concert|"
+    r"acoustic\s+version|orchestral|piano\s+version|ringtone|"
+    r"lyric[s]?\s+video|8d\s+audio|bass\s+boost(?:ed)?|"
+    r"phonk(?:\s+version)?|extended\s+mix|radio\s+edit|"
+    r"demo|rehearsal|tiktok(?:\s+version)?"
+    r")\b"
+)
+
+# Паттерн для --reject-title в yt-dlp (только для Bandcamp прямой загрузки)
+_YTDLP_REJECT = (
+    r"(?i)\b(remix|ремикс|sped.?up|ускоренн|nightcore|slowed|замедленн|"
+    r"reverb|кавер|cover\s+version|karaoke|instrumental|extended\s+mix|"
+    r"radio\s+edit|bass\s+boost|8d\s+audio|tiktok)\b"
 )
 
 # ── Лимиты ─────────────────────────────────────────────────────────
 MAX_DURATION_SEC    = 15 * 60
 MAX_OUTPUT_BYTES    = 49 * 1024 * 1024
-PER_SOURCE_TIMEOUT  = 90          # увеличен с 60 до 90 сек
+PER_SOURCE_TIMEOUT  = 90
 SHAZAM_TIMEOUT      = 30
 SHAZAM_INPUT_LIMIT  = 10 * 1024 * 1024
-DEEZER_TIMEOUT      = 8           # сек на нормализацию через Deezer
-ITUNES_TIMEOUT      = 6           # сек на нормализацию через iTunes
+DEEZER_TIMEOUT      = 8
+ITUNES_TIMEOUT      = 6
+CANDIDATES_TIMEOUT  = 25   # таймаут фазы получения кандидатов
 
 # ── Источники ───────────────────────────────────────────────────────
-VK_SOURCE      = "vk:"
-DEFAULT_SOURCES = ("vk:", "dzmsearch5:", "ytsearch10:", "scsearch10:", "bcsearch1:")
+VK_SOURCE       = "vk:"
+DEFAULT_SOURCES = ("vk:", "ytsearch10:", "scsearch10:", "bcsearch1:")
 SOURCE_LABELS   = {
     "vk:":         "VK",
-    "dzmsearch5:": "Deezer",
     "ytsearch10:": "YouTube",
     "scsearch10:": "SoundCloud",
     "bcsearch1:":  "Bandcamp",
@@ -97,15 +109,15 @@ def _split_artist_title(raw_title: str) -> tuple[str, str]:
             return left.strip(), right.strip()
     return "", clean
 
+def _is_junk(title: str) -> bool:
+    return bool(JUNK_RE.search(title))
+
 
 # ════════════════════════════════════════════════════════════════════
 #  Нормализация запроса через Deezer и iTunes (бесплатно, без ключа)
 # ════════════════════════════════════════════════════════════════════
 
 async def _normalize_via_deezer(query: str) -> str | None:
-    """Ищет трек в Deezer API (бесплатно, без ключа).
-    Возвращает 'Artist Title' в правильном порядке или None.
-    Исправляет 'sport miyagi' → 'Miyagi & Andy Panda Sport' и т.п."""
     try:
         import aiohttp
         url = f"https://api.deezer.com/search?q={urllib.parse.quote(query)}&limit=3"
@@ -116,7 +128,7 @@ async def _normalize_via_deezer(query: str) -> str | None:
         items = (data or {}).get("data") or []
         if not items:
             return None
-        track = items[0]
+        track  = items[0]
         artist = (track.get("artist") or {}).get("name", "").strip()
         title  = (track.get("title") or "").strip()
         if artist and title:
@@ -130,8 +142,6 @@ async def _normalize_via_deezer(query: str) -> str | None:
 
 
 async def _normalize_via_itunes(query: str) -> str | None:
-    """Ищет трек в iTunes Search API (бесплатно, без ключа).
-    Хорош для западной музыки и английских названий."""
     try:
         import aiohttp
         url = (
@@ -159,8 +169,6 @@ async def _normalize_via_itunes(query: str) -> str | None:
 
 
 async def _get_best_query(query: str) -> tuple[str, str | None]:
-    """Запускает Deezer и iTunes параллельно.
-    Возвращает (оригинальный_запрос, нормализованный_или_None)."""
     try:
         deezer_task = asyncio.create_task(_normalize_via_deezer(query))
         itunes_task = asyncio.create_task(_normalize_via_itunes(query))
@@ -178,7 +186,6 @@ async def _get_best_query(query: str) -> tuple[str, str | None]:
                     break
             except Exception:
                 pass
-        # Отменяем то, что ещё не завершилось
         for t in pending:
             t.cancel()
         await asyncio.gather(deezer_task, itunes_task, return_exceptions=True)
@@ -273,6 +280,89 @@ def _parse_metadata_line(stdout: bytes) -> dict:
     }
 
 
+async def _pick_best_candidate(query: str, source_prefix: str, label: str) -> str | None:
+    """Фаза 1: получаем список кандидатов без скачивания, выбираем лучший.
+
+    Возвращает URL/ID для скачивания или None если ничего не нашли.
+    """
+    args = [
+        "yt-dlp",
+        f"{source_prefix}{query}",
+        "--flat-playlist",
+        "--dump-single-json",
+        "--no-download",
+        "--no-warnings",
+        "--quiet",
+    ]
+    try:
+        rc, stdout, _ = await _run_subprocess(args, timeout=CANDIDATES_TIMEOUT)
+    except asyncio.TimeoutError:
+        logging.warning(f"[music] {label}: таймаут получения кандидатов")
+        return None
+
+    if rc != 0 or not stdout.strip():
+        return None
+
+    try:
+        data = json.loads(stdout)
+    except Exception:
+        return None
+
+    entries = data.get("entries") or []
+    if not entries:
+        # Единственный результат — сам объект
+        if data.get("id"):
+            entries = [data]
+
+    if not entries:
+        return None
+
+    best_url: str | None = None
+    fallback_url: str | None = None
+
+    for entry in entries:
+        title    = entry.get("title") or ""
+        duration = entry.get("duration") or 0
+
+        if duration and duration > MAX_DURATION_SEC:
+            continue
+        if duration and duration < 60:
+            # Слишком короткий — скорее всего превью/заставка
+            continue
+
+        # Строим URL: для YT из id, для SC/BC берём url напрямую
+        url = (
+            entry.get("url")
+            or entry.get("webpage_url")
+        )
+        if not url:
+            eid = entry.get("id")
+            if eid:
+                if "youtube" in source_prefix or "ytsearch" in source_prefix:
+                    url = f"https://www.youtube.com/watch?v={eid}"
+                else:
+                    url = eid
+
+        if not url:
+            continue
+
+        if fallback_url is None:
+            fallback_url = url
+
+        if not _is_junk(title):
+            best_url = url
+            logging.info(f"[music] {label} → оригинал: «{title}»")
+            break
+
+    if best_url:
+        return best_url
+    if fallback_url:
+        logging.info(f"[music] {label}: все результаты под фильтр, берём первый как fallback")
+        return fallback_url
+
+    return None
+
+
 async def _try_vk(query: str, tmpdir: str) -> dict | None:
     token = os.environ.get("VK_TOKEN", "").strip()
     if not token:
@@ -284,7 +374,7 @@ async def _try_vk(query: str, tmpdir: str) -> dict | None:
 
     api_url = "https://api.vk.com/method/audio.search"
     params  = {
-        "q": query, "count": "5", "auto_complete": "1",
+        "q": query, "count": "10", "auto_complete": "1",
         "sort": "2", "access_token": token, "v": "5.131",
     }
     try:
@@ -304,15 +394,23 @@ async def _try_vk(query: str, tmpdir: str) -> dict | None:
         return None
 
     items = (data.get("response") or {}).get("items") or []
-    # Prefer originals — skip remixes/sped-up/etc when possible
-    valid = [it for it in items if (it.get("url") or "").strip()]
-    clean = [
-        it for it in valid
-        if not JUNK_RE.search(f"{it.get('artist', '')} {it.get('title', '')}")
+
+    # Фильтруем: сначала ищем оригиналы, fallback — первый с URL
+    valid = [
+        it for it in items
+        if (it.get("url") or "").strip()
+        and int(it.get("duration") or 0) <= MAX_DURATION_SEC
+        and int(it.get("duration") or 1) >= 60
     ]
-    track = (clean or valid)[0] if (clean or valid) else None
+    clean = [it for it in valid if not _is_junk(f"{it.get('artist','')} {it.get('title','')}")]
+
+    track = (clean or valid or items[:1] if items else None)
+    track = track[0] if track else None
     if not track:
         return None
+
+    label_str = "оригинал" if clean and track is clean[0] else "fallback"
+    logging.info(f"[music] VK → {label_str}: «{track.get('artist')} — {track.get('title')}»")
 
     url      = track["url"]
     artist   = (track.get("artist") or "").strip()
@@ -347,28 +445,35 @@ async def _try_vk(query: str, tmpdir: str) -> dict | None:
 
 
 async def _try_source(query: str, source_prefix: str, tmpdir: str) -> dict | None:
-    """Универсальный источник через yt-dlp (YouTube, SoundCloud, Bandcamp)."""
-    label        = SOURCE_LABELS.get(source_prefix, source_prefix)
+    """Двухфазный поиск через yt-dlp (YouTube, SoundCloud, Bandcamp).
+
+    Фаза 1: получаем список кандидатов как JSON, выбираем лучший в Python.
+    Фаза 2: скачиваем только выбранный трек.
+    """
+    label = SOURCE_LABELS.get(source_prefix, source_prefix)
+
+    # Bandcamp: поиск и скачивание сразу (обычно там только оригиналы)
+    if source_prefix == "bcsearch1:":
+        download_target = f"{source_prefix}{query}"
+    else:
+        # Фаза 1: выбираем лучшего кандидата
+        download_target = await _pick_best_candidate(query, source_prefix, label)
+        if not download_target:
+            logging.info(f"[music] {label}: кандидатов не найдено")
+            return None
+
+    # Фаза 2: скачиваем
     out_template = os.path.join(tmpdir, f"track_{label}.%(ext)s")
     args = [
         "yt-dlp",
-        f"{source_prefix}{query}",
+        download_target,
         "-x",
         "--audio-format", "mp3",
         "--audio-quality", "0",
+        "--no-playlist",
         "--no-warnings",
         "--quiet",
         "--no-progress",
-        "--max-downloads", "1",
-        "--reject-title",
-        r"(?i)(remix|sped[\s\-_]?up|speed[\s\-_]?up|nightcore|slowed|reverb(?:ed)?|"
-        r"cover(?:\s+version)?|karaoke|instrumental|tribute|mashup|"
-        r"edit(?:ed)?(?:\s+version)?|live(?:\s+at|\s+from|\s+version)?|concert|"
-        r"acoustic\s+version|orchestral|piano\s+version|ringtone|"
-        r"lyric[s]?\s+video|\blyrics\b|8d\s+audio|bass\s+boost(?:ed)?|"
-        r"phonk(?:\s+version)?|1\s*hour(?:\s+loop)?|extended\s+mix|"
-        r"radio\s+edit|demo|rehearsal|tiktok|"
-        r"ускоренн|замедленн|слоу|кавер)",
         "--max-filesize", str(MAX_OUTPUT_BYTES),
         "--match-filter", f"duration < {MAX_DURATION_SEC}",
         "--print",
@@ -378,12 +483,12 @@ async def _try_source(query: str, source_prefix: str, tmpdir: str) -> dict | Non
     try:
         rc, stdout, stderr = await _run_subprocess(args, timeout=PER_SOURCE_TIMEOUT)
     except asyncio.TimeoutError:
-        logging.warning(f"[music] таймаут {label}")
+        logging.warning(f"[music] таймаут скачивания {label}")
         return None
 
     if rc != 0:
         err = stderr.decode("utf-8", errors="ignore")[-200:] if stderr else ""
-        logging.info(f"[music] {label} не нашёл (rc={rc}): {err[:150]}")
+        logging.info(f"[music] {label} не скачал (rc={rc}): {err[:150]}")
         return None
 
     meta = _parse_metadata_line(stdout)
@@ -474,13 +579,11 @@ def _parse_query(text: str) -> tuple[str, tuple[str, ...]]:
     if first in ("vk", "вк", "vkmusic") and len(rest) > 1:
         return " ".join(rest[1:]).strip(), ("vk:",)
     if first in ("yt", "youtube") and len(rest) > 1:
-        return " ".join(rest[1:]).strip(), ("ytsearch1:",)
+        return " ".join(rest[1:]).strip(), ("ytsearch10:",)
     if first in ("sc", "soundcloud", "soundc") and len(rest) > 1:
-        return " ".join(rest[1:]).strip(), ("scsearch1:",)
+        return " ".join(rest[1:]).strip(), ("scsearch10:",)
     if first in ("bc", "bandcamp") and len(rest) > 1:
         return " ".join(rest[1:]).strip(), ("bcsearch1:",)
-    if first in ("dz", "deezer") and len(rest) > 1:
-        return " ".join(rest[1:]).strip(), ("dzmsearch5:",)
     return " ".join(rest).strip(), DEFAULT_SOURCES
 
 
@@ -492,7 +595,7 @@ async def cmd_music(message: Message, bot: Bot):
     chat_id = message.chat.id
     bc_id   = message.business_connection_id
 
-    raw               = (message.text or message.caption or "").strip()
+    raw                 = (message.text or message.caption or "").strip()
     text_query, sources = _parse_query(raw)
 
     reply         = message.reply_to_message
@@ -528,10 +631,10 @@ async def cmd_music(message: Message, bot: Bot):
     shazam_meta: tuple[str, str] | None = None
 
     try:
-        # ── Этап 1: Shazam (если reply на аудио без текстового запроса) ──
+        # ── Этап 1: Shazam ────────────────────────────────────────────
         query = text_query
         if use_shazam:
-            status_id  = await _send_temp(bot, chat_id, "🎙 Распознаю через Shazam…", bc_id)
+            status_id   = await _send_temp(bot, chat_id, "🎙 Распознаю через Shazam…", bc_id)
             sample_path = os.path.join(tmpdir, "sample.bin")
             ok = await _download_telegram_file(bot, audio_file_id, sample_path)
             if not ok:
@@ -558,24 +661,20 @@ async def cmd_music(message: Message, bot: Bot):
                 f"🎙 Shazam: {artist + ' — ' if artist else ''}{title}\n🔎 Ищу полную версию…"
             )
 
-        # ── Этап 2: Нормализация запроса через Deezer + iTunes ──
-        # Запускаем параллельно с первым поиском — не теряем время.
-        # Нормализация нужна только при текстовом запросе (не Shazam).
+        # ── Этап 2: Нормализация запроса ──────────────────────────────
         normalized_query: str | None = None
         if text_query and sources == DEFAULT_SOURCES:
             _, normalized_query = await _get_best_query(query)
-            # Если нормализованный == оригинальному — не дублируем поиск
             if normalized_query and normalized_query.lower().strip() == query.lower().strip():
                 normalized_query = None
 
-        # ── Этап 3: Статус ──
+        # ── Этап 3: Статус ────────────────────────────────────────────
         if status_id is None:
             status_id = await _send_temp(bot, chat_id, SEARCH_STATUS, bc_id, parse_mode="HTML")
         else:
             await _edit_temp(bot, chat_id, status_id, bc_id, SEARCH_STATUS, parse_mode="HTML")
 
-        # ── Этап 4: Параллельный поиск ──
-        # Убираем VK если токена нет.
+        # ── Этап 4: Параллельный поиск ────────────────────────────────
         active_sources = tuple(
             p for p in sources
             if p != VK_SOURCE or os.environ.get("VK_TOKEN", "").strip()
@@ -587,14 +686,9 @@ async def cmd_music(message: Message, bot: Bot):
             await _delete_temp(bot, chat_id, err, bc_id)
             return
 
-        # Формируем задачи:
-        #   • Оригинальный запрос — все источники
-        #   • Нормализованный запрос (если отличается) — только YouTube + VK
-        #     (они лучше всего ищут по точному названию)
         async def _src_task(q: str, prefix: str) -> tuple[str, dict | None]:
             label = SOURCE_LABELS.get(prefix, prefix)
-            suffix = "_norm" if q != query else ""
-            sub = tempfile.mkdtemp(prefix=f"music_{label}{suffix}_", dir=tmpdir)
+            sub   = tempfile.mkdtemp(prefix=f"music_{label}_", dir=tmpdir)
             try:
                 if prefix == VK_SOURCE:
                     res = await _try_vk(q, sub)
@@ -608,9 +702,9 @@ async def cmd_music(message: Message, bot: Bot):
             return label, res
 
         tasks_list = [(_src_task(query, p), p) for p in active_sources]
-        # Добавляем нормализованный запрос на YouTube и VK
+        # Нормализованный запрос — дополнительно на YT и VK
         if normalized_query:
-            for p in ("ytsearch10:", "dzmsearch5:", "vk:"):
+            for p in ("ytsearch10:", "vk:"):
                 if p in active_sources:
                     tasks_list.append((_src_task(normalized_query, p), p + "_norm"))
 
@@ -647,7 +741,7 @@ async def cmd_music(message: Message, bot: Bot):
             await _delete_temp(bot, chat_id, err, bc_id)
             return
 
-        # ── Этап 5: Теги и отправка ──
+        # ── Этап 5: Теги и отправка ───────────────────────────────────
         size = os.path.getsize(found["filepath"])
         if size > MAX_OUTPUT_BYTES:
             await _delete_temp(bot, chat_id, status_id, bc_id)
