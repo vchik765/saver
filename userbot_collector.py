@@ -3,13 +3,11 @@ Telegram Userbot — Сборщик юзернеймов (24/7)
 
 Три способа сбора:
   1. АВТО      — каждый день в RUN_HOUR:00 UTC обходит список участников групп
-  2. ПАССИВНЫЙ — постоянно следит за сообщениями во всех группах,
-                 при каждом новом сообщении добавляет автора в базу
-  3. РУЧНОЙ    — напиши .собрать в группе → соберёт 100 уников оттуда
+  2. ПАССИВНЫЙ — постоянно следит за новыми сообщениями во всех группах
+  3. РУЧНОЙ    — напиши .собрать в группе → листает 1000+ сообщений вверх
+                 и собирает юзернеймы всех кто писал (работает в любой группе)
 
-Все три способа работают с одной базой — дублей не будет.
-Пассивный сбор накапливает юзернеймы и раз в PASSIVE_FLUSH_EVERY штук
-отправляет пачку в Избранное.
+Все три режима — одна база, нулевые дубликаты.
 """
 
 import asyncio
@@ -36,20 +34,17 @@ SESSION_STRING = os.environ.get("SESSION_STRING", "")
 
 RUN_HOUR             = 12    # час автосбора (UTC). 12 = 15:00 мск
 MAX_PER_DAY          = 200   # лимит автосбора в день
-MANUAL_LIMIT         = 100   # сколько собирает .собрать за раз
+MANUAL_HISTORY_LIMIT = 1000  # сколько сообщений листать при .собрать
 BATCH_SIZE           = 50    # юзернеймов в одном сообщении в Избранное
 DELAY_BETWEEN_GROUPS = 8     # сек между группами (автосбор)
-DELAY_BETWEEN_CHUNKS = 2     # сек между запросами участников
+DELAY_BETWEEN_CHUNKS = 2     # сек между запросами участников (автосбор)
 MAX_PER_GROUP        = 500   # лимит участников из одной группы (автосбор)
-
-# Пассивный сбор: накапливаем и сбрасываем в Избранное пачкой
-PASSIVE_FLUSH_EVERY  = 50    # отправлять в Избранное каждые N новых юзернеймов
+PASSIVE_FLUSH_EVERY  = 50    # сбрасывать пассивный буфер каждые N юзернеймов
 
 STATE_FILE = "collector_state.json"
 
-# Глобальный стейт — общий для всех трёх режимов
 _state_lock      = asyncio.Lock()
-_passive_pending: list[str] = []   # накопленные из сообщений, ещё не отправленные
+_passive_pending: list = []
 
 
 # ══════════════════════════════════════════════════════════════
@@ -98,10 +93,52 @@ async def send_to_saved(app: Client, usernames: list, label: str = ""):
 
 
 # ══════════════════════════════════════════════════════════════
-#  Сборка из списка участников (для авто и .собрать)
+#  Сборка из истории сообщений (для .собрать)
 # ══════════════════════════════════════════════════════════════
 
-async def collect_from_group(
+async def collect_from_history(
+    app: Client,
+    chat_id,
+    existing: set,
+    limit: int = MANUAL_HISTORY_LIMIT,
+) -> list:
+    """Листает историю сообщений группы и собирает юзернеймы авторов.
+    Работает в любой группе — даже если список участников скрыт."""
+    found = []
+    seen_in_run: set = set()  # чтобы не добавлять дважды в рамках одного запуска
+    count = 0
+
+    try:
+        async for msg in app.get_chat_history(chat_id, limit=limit):
+            count += 1
+            user = msg.from_user
+            if not user or not user.username or user.is_bot:
+                continue
+            uname = user.username.lower()
+            if uname in existing or uname in seen_in_run:
+                continue
+            found.append(user.username)
+            seen_in_run.add(uname)
+
+            # Небольшая пауза каждые 200 сообщений чтобы не перегружать
+            if count % 200 == 0:
+                await asyncio.sleep(1)
+
+    except FloodWait as e:
+        log.warning(f"FloodWait {e.value}с при чтении истории...")
+        await asyncio.sleep(e.value + 5)
+    except Exception as e:
+        log.warning(f"Ошибка collect_from_history: {e}")
+
+    log.info(f"История: просмотрено {count} сообщений, найдено {len(found)} новых юзернеймов")
+    return found
+
+
+# ══════════════════════════════════════════════════════════════
+#  Сборка из списка участников (для автосбора)
+# ══════════════════════════════════════════════════════════════
+
+async def collect_from_members(
     app: Client,
     chat_id,
     existing: set,
@@ -126,18 +163,17 @@ async def collect_from_group(
         log.warning(f"FloodWait {e.value}с...")
         await asyncio.sleep(e.value + 5)
     except ChatAdminRequired:
-        log.info("Нет прав смотреть список — используй пассивный сбор")
+        log.info("Нет прав смотреть список участников")
     except Exception as e:
-        log.warning(f"Ошибка collect_from_group: {e}")
+        log.warning(f"Ошибка collect_from_members: {e}")
     return found
 
 
 # ══════════════════════════════════════════════════════════════
-#  РЕЖИМ 2: Пассивный сбор из сообщений
+#  РЕЖИМ 2: Пассивный сбор из новых сообщений
 # ══════════════════════════════════════════════════════════════
 
 def setup_passive_handler(app: Client):
-    """Слушает все входящие сообщения в группах и собирает юзернеймы авторов."""
 
     @app.on_message(filters.group & ~filters.me)
     async def on_group_message(client: Client, message: Message):
@@ -154,15 +190,13 @@ def setup_passive_handler(app: Client):
             existing = set(u.lower() for u in state["collected"])
 
             if uname in existing:
-                return  # уже есть — пропускаем
+                return
 
-            # Новый юзернейм — добавляем
             _passive_pending.append(user.username)
             state["collected"].append(user.username)
             save_state(state)
             log.info(f"[пассивный] +@{user.username} из {message.chat.title[:30]} (буфер: {len(_passive_pending)})")
 
-            # Если накопилось достаточно — сбрасываем в Избранное
             if len(_passive_pending) >= PASSIVE_FLUSH_EVERY:
                 to_send = _passive_pending[:]
                 _passive_pending = []
@@ -170,7 +204,7 @@ def setup_passive_handler(app: Client):
 
 
 # ══════════════════════════════════════════════════════════════
-#  РЕЖИМ 3: Ручная команда .собрать
+#  РЕЖИМ 3: Ручная команда .собрать — листает историю сообщений
 # ══════════════════════════════════════════════════════════════
 
 def setup_manual_handler(app: Client):
@@ -191,15 +225,15 @@ def setup_manual_handler(app: Client):
 
         status_msg = await client.send_message(
             "me",
-            f"⏳ Собираю юзернеймы из «{chat_title}»..."
+            f"⏳ Листаю последние {MANUAL_HISTORY_LIMIT} сообщений в «{chat_title}»..."
         )
 
         async with _state_lock:
             state    = load_state()
             existing = set(u.lower() for u in state["collected"])
 
-            found = await collect_from_group(
-                client, chat_id, existing, limit=MANUAL_LIMIT
+            found = await collect_from_history(
+                client, chat_id, existing, limit=MANUAL_HISTORY_LIMIT
             )
 
             if found:
@@ -208,16 +242,16 @@ def setup_manual_handler(app: Client):
                 await send_to_saved(client, found, label=chat_title[:20])
                 await client.edit_message_text(
                     "me", status_msg.id,
-                    f"✅ «{chat_title}»: {len(found)} новых юзернеймов\n"
+                    f"✅ «{chat_title[:30]}»\n"
+                    f"Просмотрено: {MANUAL_HISTORY_LIMIT} сообщений\n"
+                    f"Новых юзернеймов: {len(found)}\n"
                     f"Всего в базе: {len(state['collected'])}"
                 )
             else:
-                # Список участников недоступен — подсказываем
                 await client.edit_message_text(
                     "me", status_msg.id,
-                    f"ℹ️ «{chat_title}»: список участников скрыт.\n"
-                    f"Пассивный сбор уже работает — юзернеймы добавляются\n"
-                    f"автоматически по мере того как люди пишут в группе.\n"
+                    f"😕 «{chat_title[:30]}»: новых юзернеймов не найдено\n"
+                    f"(все уже есть в базе)\n"
                     f"Всего в базе: {len(state['collected'])}"
                 )
 
@@ -259,7 +293,7 @@ async def run_once(app: Client):
                 continue
 
             log.info(f"[авто] обхожу: {chat.title[:40]} ...")
-            found = await collect_from_group(app, chat.id, collected)
+            found = await collect_from_members(app, chat.id, collected)
             space = remaining - len(new_today)
             found = found[:space]
 
@@ -287,14 +321,11 @@ async def run_once(app: Client):
 async def scheduler(app: Client):
     log.info(f"Планировщик: автосбор каждый день в {RUN_HOUR}:00 UTC ({RUN_HOUR+3}:00 мск)")
     last_run_date = None
-
-    # Сброс накопленного пассивного буфера раз в час
-    last_flush = datetime.utcnow()
+    last_flush    = datetime.utcnow()
 
     while True:
         now = datetime.utcnow()
 
-        # Ежедневный автосбор
         if now.hour == RUN_HOUR and last_run_date != now.date():
             log.info("Запускаю ежедневный автосбор...")
             try:
@@ -330,7 +361,7 @@ async def main():
     async with Client("userbot", API_ID, API_HASH, session_string=SESSION_STRING) as app:
         setup_passive_handler(app)
         setup_manual_handler(app)
-        log.info("✅ Подключено! Слушаю сообщения + жду .собрать + планировщик активен")
+        log.info("✅ Подключено! Пассивный сбор активен + слушаю .собрать")
         await scheduler(app)
 
 if __name__ == "__main__":
