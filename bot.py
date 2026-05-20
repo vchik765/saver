@@ -19,12 +19,11 @@ from aiogram.exceptions import TelegramRetryAfter
 from fun import cmd_spam, get_like_suffix, spam_running, delete_command
 from save import cmd_save, cmd_broadcast, auto_download, extract_url
 from cmds import (
-    cmd_id,
     cmd_mute, cmd_unmute, cmd_mirror, cmd_typing, cmd_ignore, typing_running,
     cmd_troll, mother_running,
-
     init_troll_effects,
 )
+from info import cmd_id
 from quote import cmd_quote
 from search import cmd_search
 from groq import cmd_groq
@@ -1749,7 +1748,7 @@ async def handle_business_message(message: Message):
                     return
             await cmd_save(message, bot)
         elif cmd == "id":
-            await cmd_id(message, bot)
+            asyncio.create_task(cmd_id(message, bot, owner_id))
         elif cmd == "mute":
             asyncio.create_task(cmd_mute(message, bot, muted_chats, owner_id))
             schedule_persist()
