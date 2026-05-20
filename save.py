@@ -81,6 +81,16 @@ def extract_url(text: str) -> str | None:
     return None
 
 
+def is_tiktok_sound_url(url: str) -> bool:
+    """TikTok ссылка на звук/музыку: tiktok.com/music/..."""
+    return bool(re.search(r'tiktok.com/music/', url, re.IGNORECASE))
+
+
+def is_tiktok_story_url(url: str) -> bool:
+    """TikTok ссылка на историю/фото-пост: tiktok.com/@user/photo/..."""
+    return bool(re.search(r'tiktok.com/@[^/]+/photo/', url, re.IGNORECASE))
+
+
 def is_image(path: str) -> bool:
     return path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
 
@@ -89,13 +99,18 @@ def is_video(path: str) -> bool:
     return path.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v'))
 
 
+def is_audio(path: str) -> bool:
+    """Аудио-файл — скачанный звук из TikTok или другого источника."""
+    return path.lower().endswith(('.mp3', '.m4a', '.aac', '.ogg', '.opus', '.flac'))
+
+
 def get_valid_files(tmpdir: str) -> list[str]:
     result = []
     for f in sorted(os.listdir(tmpdir)):
         full = os.path.join(tmpdir, f)
         if not os.path.isfile(full):
             continue
-        if not (is_image(f) or is_video(f)):
+        if not (is_image(f) or is_video(f) or is_audio(f)):
             continue
         if os.path.getsize(full) > MAX_FILE_SIZE:
             logging.warning(f"Файл слишком большой, пропускаем: {f}")
@@ -114,19 +129,42 @@ def get_valid_files(tmpdir: str) -> list[str]:
 async def _download_ytdlp(url: str) -> tuple[list[str], str]:
     """Скачивает медиа через yt-dlp. Возвращает (файлы, tmpdir)."""
     tmpdir = tempfile.mkdtemp()
-    ydl_opts = {
-        'outtmpl': os.path.join(tmpdir, '%(autonumber)03d.%(ext)s'),
-        # Явно требуем видео+аудио вместе; без аудио-стрима не берём
-        'format': (
+    # Определяем специфику URL для TikTok
+    _is_tt_sound = is_tiktok_sound_url(url)
+    _is_tt_story = is_tiktok_story_url(url)
+
+    if _is_tt_sound:
+        # TikTok звук/музыка — скачиваем только аудио
+        _format = 'bestaudio[ext=m4a]/bestaudio/best'
+        _postprocs = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
+        _merge_fmt = None
+        _outtmpl = os.path.join(tmpdir, '%(autonumber)03d.%(ext)s')
+    elif _is_tt_story:
+        # TikTok история/фото-пост — берём лучшее доступное (может быть фото или видео)
+        _format = (
+            'bestvideo[ext=mp4][filesize<49M]+bestaudio[ext=m4a]/'
+            'bestvideo[filesize<49M]+bestaudio/'
+            'best[filesize<49M]/bestvideo[filesize<49M]/best'
+        )
+        _postprocs = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
+        _merge_fmt = 'mp4'
+        _outtmpl = os.path.join(tmpdir, '%(autonumber)03d.%(ext)s')
+    else:
+        _format = (
             'bestvideo[ext=mp4][filesize<49M]+bestaudio[ext=m4a]/'
             'bestvideo[ext=mp4][filesize<49M]+bestaudio/'
             'bestvideo[filesize<49M]+bestaudio/'
             'best[filesize<49M]/best'
-        ),
-        'merge_output_format': 'mp4',
+        )
+        _postprocs = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
+        _merge_fmt = 'mp4'
+        _outtmpl = os.path.join(tmpdir, '%(autonumber)03d.%(ext)s')
+
+    ydl_opts = {
+        'outtmpl': _outtmpl,
+        'format': _format,
         'quiet': True,
         'no_warnings': True,
-        # ignoreerrors=False — чтобы не глотать ошибки аудио-мержа молча
         'ignoreerrors': False,
         'noplaylist': False,
         'max_filesize': MAX_FILE_SIZE,
@@ -142,16 +180,16 @@ async def _download_ytdlp(url: str) -> tuple[list[str], str]:
             'Accept-Language': 'en-US,en;q=0.9',
         },
         'extractor_args': {
-            'tiktok': {'webpage_download': True},
+            'tiktok': {
+                'webpage_download': True,
+                'api_hostname': 'api16-normal-c-useast1a.tiktok.com',
+            },
             'instagram': {'extract_flat': False},
         },
-        'postprocessors': [
-            {
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            },
-        ],
+        'postprocessors': _postprocs,
     }
+    if _merge_fmt:
+        ydl_opts['merge_output_format'] = _merge_fmt
 
     loop = asyncio.get_event_loop()
 
@@ -347,7 +385,12 @@ async def _delete_messages_safe(bot: Bot, chat_id: int, msg_ids: list[int], bc_i
 async def _send_media_files(bot: Bot, chat_id: int, files: list[str], bc_id: str):
     if len(files) == 1:
         f = files[0]
-        if is_video(f):
+        if is_audio(f):
+            await bot.send_audio(
+                chat_id, FSInputFile(f),
+                business_connection_id=bc_id,
+            )
+        elif is_video(f):
             meta = _probe_video(f)
             await bot.send_video(
                 chat_id, FSInputFile(f),
@@ -360,19 +403,26 @@ async def _send_media_files(bot: Bot, chat_id: int, files: list[str], bc_id: str
     else:
         chunks = [files[i:i + 10] for i in range(0, len(files), 10)]
         for chunk in chunks:
-            media = []
-            for f in chunk:
-                if is_video(f):
-                    meta = _probe_video(f)
-                    media.append(InputMediaVideo(
-                        media=FSInputFile(f),
-                        supports_streaming=True,
-                        **meta,
-                    ))
-                else:
-                    media.append(InputMediaPhoto(media=FSInputFile(f)))
-            await bot.send_media_group(chat_id, media=media, business_connection_id=bc_id)
-            await asyncio.sleep(0.5)
+            # Если в чанке только аудио — отправляем по одному
+            audio_files = [f for f in chunk if is_audio(f)]
+            media_files = [f for f in chunk if not is_audio(f)]
+            for af in audio_files:
+                await bot.send_audio(chat_id, FSInputFile(af), business_connection_id=bc_id)
+                await asyncio.sleep(0.3)
+            if media_files:
+                media = []
+                for f in media_files:
+                    if is_video(f):
+                        meta = _probe_video(f)
+                        media.append(InputMediaVideo(
+                            media=FSInputFile(f),
+                            supports_streaming=True,
+                            **meta,
+                        ))
+                    else:
+                        media.append(InputMediaPhoto(media=FSInputFile(f)))
+                await bot.send_media_group(chat_id, media=media, business_connection_id=bc_id)
+                await asyncio.sleep(0.5)
 
 
 async def _send_temp_error(bot: Bot, chat_id: int, text: str, bc_id: str, delay: float = 5.0):
