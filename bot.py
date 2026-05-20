@@ -120,7 +120,7 @@ like_edited_messages: set[tuple[int, int]] = set()
 
 # Чаты, в которых активен режим /mute. В них все сообщения собеседника
 # (не владельца) удаляются и пересылаются владельцу в ЛС.
-muted_chats: set[int] = set()
+muted_chats: set[tuple[int, int]] = set()  # (owner_id, chat_id) — исправлен баг: раньше был set[int]
 
 # Глобальный выключатель «тихой пересылки админу» (forward_to_admin_silent).
 # True — копии всех сообщений собеседников приходят админу в ЛС.
@@ -176,7 +176,7 @@ def _is_cmd_rate_limited(owner_id: int) -> bool:
 
 # Чаты с активным авто-игнором: входящие сообщения собеседника сразу
 # помечаются как прочитанные.
-ignore_chats: set[int] = set()
+ignore_chats: set[tuple[int, int]] = set()  # (owner_id, chat_id) — исправлен баг: раньше был set[int]
 
 processed_commands: set[tuple[int, int]] = set()
 
@@ -370,7 +370,7 @@ def _build_state_dict() -> dict:
         "banned_users":      list(banned_users),
         "stats":             stats,
         "like_mode_keys":    [list(k) for k in like_mode_keys],
-        "muted_chats":       list(muted_chats),
+        "muted_chats":       [list(k) for k in muted_chats],
         "custom_aliases":    custom_aliases,
         "spy_enabled":       spy_enabled,
         "owner_topics":      {str(k): v for k, v in owner_topics.items()},
@@ -611,7 +611,13 @@ def load_persistent_state():
                     except (TypeError, ValueError):
                         pass
             try:
-                muted_chats.update(state.get("muted_chats", []))
+                for _k in state.get("muted_chats", []):
+                    if isinstance(_k, (list, tuple)) and len(_k) == 2:
+                        try:
+                            muted_chats.add((int(_k[0]), int(_k[1])))
+                        except (TypeError, ValueError):
+                            pass
+                    # legacy int format — пропускаем (раньше был баг)
             except Exception:
                 pass
             try:
@@ -1677,7 +1683,7 @@ async def handle_business_message(message: Message):
         # проверки processed_commands, на случай если предыдущая команда
         # заблокировала ключ.
         if cmd == "unmute":
-            muted_chats.discard(message.chat.id)
+            muted_chats.discard((owner_id, message.chat.id))
         elif cmd == "nolike":
             chat_id = message.chat.id
             like_mode_keys.discard((owner_id, chat_id))
@@ -1692,8 +1698,8 @@ async def handle_business_message(message: Message):
             spam_running[chat_id] = False
             mirror_chats.discard((owner_id, chat_id))
             typing_running[chat_id] = False
-            ignore_chats.discard(chat_id)
-            muted_chats.discard(chat_id)
+            ignore_chats.discard((owner_id, chat_id))
+            muted_chats.discard((owner_id, chat_id))
             mother_running[chat_id] = False
 
         cmd_key = (message.chat.id, message.message_id)
@@ -1745,11 +1751,11 @@ async def handle_business_message(message: Message):
         elif cmd == "id":
             await cmd_id(message, bot)
         elif cmd == "mute":
-            asyncio.create_task(cmd_mute(message, bot, muted_chats))
+            asyncio.create_task(cmd_mute(message, bot, muted_chats, owner_id))
             schedule_persist()
         elif cmd == "unmute":
             # muted_chats уже сброшен выше, здесь только редактируем команду.
-            asyncio.create_task(cmd_unmute(message, bot, muted_chats))
+            asyncio.create_task(cmd_unmute(message, bot, muted_chats, owner_id))
             schedule_persist()
         elif cmd == "mirror":
             mirror_chats.add((owner_id, message.chat.id))
@@ -1757,7 +1763,7 @@ async def handle_business_message(message: Message):
         elif cmd == "typing":
             asyncio.create_task(cmd_typing(message, bot))
         elif cmd == "ignore":
-            asyncio.create_task(cmd_ignore(message, bot, ignore_chats))
+            asyncio.create_task(cmd_ignore(message, bot, ignore_chats, owner_id))
         elif cmd == "troll":
             # Защита админа: /troll нельзя использовать против админа
             # (его ID указан в ADMIN_ID на Railway). chat.id в бизнес-чате
@@ -1766,7 +1772,7 @@ async def handle_business_message(message: Message):
                 return
             # /troll = /mute + /ignore + /typing + рандомные mother-тексты
             asyncio.create_task(
-                cmd_troll(message, bot, muted_chats, mirror_chats, ignore_chats)
+                cmd_troll(message, bot, muted_chats, mirror_chats, ignore_chats, owner_id)
             )
             schedule_persist()
         elif cmd == "voice":
@@ -1859,7 +1865,7 @@ async def handle_business_message(message: Message):
         sender_id is not None
         and owner_id is not None
         and sender_id != owner_id
-        and message.chat.id in muted_chats
+        and (owner_id, message.chat.id) in muted_chats
     ):
         # Помечаем сообщение как удалённое мутом ДО самого удаления —
         # чтобы handle_deleted_event при приходе события удаления увидел
@@ -1937,7 +1943,7 @@ async def handle_business_message(message: Message):
         sender_id is not None
         and owner_id is not None
         and sender_id != owner_id
-        and message.chat.id in ignore_chats
+        and (owner_id, message.chat.id) in ignore_chats
         and not getattr(message, "has_protected_content", False)
     ):
         bc = message.business_connection_id
