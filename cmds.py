@@ -75,27 +75,7 @@ async def init_troll_effects(bot) -> None:
 mother_running: dict[int, bool] = {}
 
 
-async def cmd_id(message: Message, bot: Bot):
-    if message.reply_to_message and message.reply_to_message.from_user:
-        user = message.reply_to_message.from_user
-    else:
-        user = message.from_user
-
-    await delete_command(message, bot)
-
-    uid = user.id if user else "—"
-    username = f"@{user.username}" if (user and user.username) else "—"
-
-    text = (
-        f'<tg-emoji emoji-id="5904630315946611415">👤</tg-emoji> '
-        f'<b>{username}</b> | <code>{uid}</code>'
-    )
-    await bot.send_message(
-        message.chat.id,
-        text,
-        parse_mode="HTML",
-        business_connection_id=message.business_connection_id,
-    )
+# cmd_id перенесён в info.py (ОСИНТ-модуль, отправляет результат в ЛС владельца)
 
 
 MUTE_TEXT = '<tg-emoji emoji-id="5431449413849486465">❤</tg-emoji>| Помолчи'
