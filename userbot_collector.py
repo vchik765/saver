@@ -28,6 +28,203 @@ log = logging.getLogger("collector")
 #  НАСТРОЙКИ
 # ══════════════════════════════════════════════════════════════
 
+
+import random
+import re
+
+# ══════════════════════════════════════════════════════════════
+#  РАССЫЛКА (novie pravki)
+# ══════════════════════════════════════════════════════════════
+
+BROADCAST_FILE = "broadcast_state.json"
+DAILY_BROADCAST_LIMIT = 25      # макс. рассылок в день разным людям
+BROADCAST_SEND_DELAY  = (4, 10) # случайная задержка между отправками (сек)
+
+# Таблица замены: русские буквы → визуально идентичные латинские
+_RU_EN_MAP: dict[str, str] = {
+    'а': 'a', 'А': 'A',
+    'е': 'e', 'Е': 'E',
+    'о': 'o', 'О': 'O',
+    'р': 'p', 'Р': 'P',
+    'с': 'c', 'С': 'C',
+    'у': 'y', 'У': 'Y',
+    'х': 'x', 'Х': 'X',
+    'к': 'k',  # строчная к ≈ k (одинаково)
+    'В': 'B',
+    'М': 'M',
+    'Т': 'T',
+    'Н': 'H',
+}
+
+
+def load_broadcast_state() -> dict:
+    """Загружает состояние рассылки."""
+    if Path(BROADCAST_FILE).exists():
+        try:
+            return json.loads(Path(BROADCAST_FILE).read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"text": "", "sent_users": [], "daily_log": {}}
+
+
+def save_broadcast_state(state: dict):
+    Path(BROADCAST_FILE).write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _variate_text(text: str) -> str:
+    """Делает текст слегка уникальным чтобы не попасть под спам-фильтры.
+
+    Применяет три техники:
+    1. Заменяет ~25% подходящих русских букв на визуально идентичные латинские.
+    2. В ~20% мест заменяет одиночный пробел на двойной.
+    3. Добавляет невидимый символ (zero-width space) в случайное место.
+    """
+    chars = list(text)
+    # 1. Частичная замена букв
+    for i, ch in enumerate(chars):
+        if ch in _RU_EN_MAP and random.random() < 0.25:
+            chars[i] = _RU_EN_MAP[ch]
+    # 2. Двойные пробелы
+    result: list[str] = []
+    for ch in chars:
+        if ch == ' ' and random.random() < 0.20:
+            result.append('  ')
+        else:
+            result.append(ch)
+    # 3. Невидимый символ в случайную позицию (не в начало/конец)
+    if len(result) > 4:
+        pos = random.randint(2, len(result) - 2)
+        result.insert(pos, '\u200b')
+    return ''.join(result)
+
+
+async def get_group_admin_usernames(app) -> set:
+    """Возвращает set юзернеймов (lower) всех администраторов групп,
+    в которых состоит юзербот. Им рассылка не идёт — они могут
+    заблокировать аккаунт в своей группе."""
+    admins: set = set()
+    try:
+        async for dialog in app.get_dialogs():
+            chat = dialog.chat
+            if chat.type.name not in ("GROUP", "SUPERGROUP"):
+                continue
+            try:
+                async for member in app.get_chat_members(chat.id, filter="administrators"):
+                    if member.user and member.user.username:
+                        admins.add(member.user.username.lower())
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning(f"[broadcast] ошибка сбора админов: {e}")
+    return admins
+
+
+async def run_broadcast(app) -> None:
+    """Выполняет пассивную рассылку: до DAILY_BROADCAST_LIMIT разным
+    пользователям в сутки. Один и тот же человек никогда не получит
+    рассылку дважды. Пропускаем:
+      — тех, у кого платные входящие (get_users вернёт is_premium или
+        send_message выбросит PREMIUM_ACCOUNT_REQUIRED);
+      — администраторов чатов где состоит юзербот;
+      — ботов.
+    """
+    state = load_broadcast_state()
+    if not state.get("text"):
+        return   # текст не задан — нечего рассылать
+
+    today = today_str()
+    daily_sent: list = state.get("daily_log", {}).get(today, [])
+    if len(daily_sent) >= DAILY_BROADCAST_LIMIT:
+        log.info(f"[broadcast] дневной лимит {DAILY_BROADCAST_LIMIT} достигнут")
+        return
+
+    collector_state = load_state()
+    all_usernames: list = collector_state.get("collected", [])
+    if not all_usernames:
+        log.info("[broadcast] база юзернеймов пуста")
+        return
+
+    already_sent: set = set(u.lower() for u in state.get("sent_users", []))
+    sent_today_set: set = set(u.lower() for u in daily_sent)
+    admin_usernames: set = await get_group_admin_usernames(app)
+
+    candidates = [
+        u for u in all_usernames
+        if u.lower() not in already_sent
+        and u.lower() not in sent_today_set
+        and u.lower() not in admin_usernames
+    ]
+    if not candidates:
+        log.info("[broadcast] нет новых кандидатов для рассылки")
+        return
+
+    remaining = DAILY_BROADCAST_LIMIT - len(daily_sent)
+    to_send = candidates[:remaining]
+    sent_ok: list = []
+    sent_fail: list = []
+
+    for username in to_send:
+        try:
+            # Проверяем пользователя
+            try:
+                user = await app.get_users(username)
+                if user.is_bot:
+                    log.info(f"[broadcast] пропускаем бота @{username}")
+                    continue
+            except Exception as e:
+                log.warning(f"[broadcast] не нашли @{username}: {e}")
+                continue
+
+            varied = _variate_text(state["text"])
+            await app.send_message(username, varied)
+            sent_ok.append(username)
+            log.info(f"[broadcast] отправлено @{username}")
+
+            delay = random.uniform(*BROADCAST_SEND_DELAY)
+            await asyncio.sleep(delay)
+
+        except FloodWait as e:
+            log.warning(f"[broadcast] FloodWait {e.value}с...")
+            await asyncio.sleep(e.value + 5)
+        except Exception as e:
+            err_str = str(e).lower()
+            if "premium" in err_str or "paid" in err_str or "stars" in err_str:
+                log.info(f"[broadcast] @{username} требует платные сообщения — пропускаем")
+            else:
+                log.warning(f"[broadcast] ошибка @{username}: {e}")
+                sent_fail.append(username)
+
+    # Сохраняем результаты
+    all_sent_lower = [u.lower() for u in sent_ok]
+    state["sent_users"] = list(dict.fromkeys(
+        state.get("sent_users", []) + all_sent_lower
+    ))
+    if today not in state["daily_log"]:
+        state["daily_log"][today] = []
+    state["daily_log"][today].extend(sent_ok)
+    # Чистим старые дни (оставляем 30 дней)
+    cutoff_date = sorted(state["daily_log"].keys())
+    if len(cutoff_date) > 30:
+        for old_day in cutoff_date[:-30]:
+            del state["daily_log"][old_day]
+    save_broadcast_state(state)
+
+    if sent_ok or sent_fail:
+        summary = (
+            f"📤 Рассылка [{today}]:\n"
+            f"✅ Отправлено: {len(sent_ok)}\n"
+            f"❌ Ошибок: {len(sent_fail)}\n"
+            f"📊 Сегодня итого: {len(daily_sent) + len(sent_ok)}/{DAILY_BROADCAST_LIMIT}\n"
+            f"👥 Всего охвачено уникальных: {len(state['sent_users'])}"
+        )
+        try:
+            await app.send_message("me", summary)
+        except Exception:
+            pass
+    log.info(f"[broadcast] итог: ок={len(sent_ok)}, ошиб={len(sent_fail)}")
+
 API_ID         = 2040
 API_HASH       = "b18441a1ff607e10a989891a5462e627"
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
@@ -340,6 +537,13 @@ async def scheduler(app: Client):
                 log.exception(f"Ошибка автосбора: {e}")
             last_run_date = now.date()
 
+        # Рассылка: запускаем каждый час (пассивно, до 25 чел/день)
+        if (now - last_flush).seconds >= 3600:
+            try:
+                await run_broadcast(app)
+            except Exception as e:
+                log.warning(f"[broadcast] ошибка в планировщике: {e}")
+
         # Принудительный сброс пассивного буфера раз в час
         if (now - last_flush).seconds >= 3600 and _passive_pending:
             async with _state_lock:
@@ -357,6 +561,76 @@ async def scheduler(app: Client):
 #  Точка входа
 # ══════════════════════════════════════════════════════════════
 
+
+
+def setup_broadcast_handler(app: Client):
+    """Команды управления рассылкой (только для себя):
+
+    .рассылка <текст>  — установить текст рассылки (рассылка пассивная, до 25 чел/день)
+    .рассылка          — показать текущий текст и статистику
+    .рассылкастоп      — сбросить счётчик отправленных (полный сброс)
+    """
+
+    @app.on_message(
+        filters.regex(r"^\.рассылка(?:\s+([\s\S]+))?$") & filters.me
+    )
+    async def handle_broadcast_cmd(client: Client, message: Message):
+        match = message.matches[0] if message.matches else None
+        new_text = match.group(1).strip() if match and match.group(1) else None
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        state = load_broadcast_state()
+
+        if new_text:
+            state["text"] = new_text
+            save_broadcast_state(state)
+            await client.send_message(
+                "me",
+                f"✅ Текст рассылки установлен:\n\n{new_text}\n\n"
+                f"Рассылка пассивная: до {DAILY_BROADCAST_LIMIT} чел/день.\n"
+                f"Один человек получит только один раз."
+            )
+        else:
+            today = today_str()
+            daily_count = len(state.get("daily_log", {}).get(today, []))
+            total_sent = len(state.get("sent_users", []))
+            current_text = state.get("text", "")
+            collector_state = load_state()
+            total_base = len(collector_state.get("collected", []))
+            await client.send_message(
+                "me",
+                f"📊 Статус рассылки:\n\n"
+                f"📝 Текст: {current_text[:300] if current_text else '(не задан)'}\n\n"
+                f"📅 Сегодня отправлено: {daily_count}/{DAILY_BROADCAST_LIMIT}\n"
+                f"👥 Всего уникальных получателей: {total_sent}\n"
+                f"📋 В базе юзернеймов: {total_base}\n"
+                f"📬 Осталось охватить: {max(0, total_base - total_sent)}"
+            )
+
+    @app.on_message(
+        filters.regex(r"^\.рассылкастоп$") & filters.me
+    )
+    async def handle_broadcast_stop(client: Client, message: Message):
+        """Сбрасывает список отправленных (начать заново с теми же людьми)."""
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        state = load_broadcast_state()
+        count = len(state.get("sent_users", []))
+        state["sent_users"] = []
+        state["daily_log"] = {}
+        save_broadcast_state(state)
+        await client.send_message(
+            "me",
+            f"🔄 Список рассылки сброшен (было {count} человек).\n"
+            f"Рассылка начнётся с начала базы."
+        )
+
 async def main():
     if not SESSION_STRING:
         log.error("SESSION_STRING не задан в Railway Variables!")
@@ -366,7 +640,8 @@ async def main():
     async with Client("userbot", API_ID, API_HASH, session_string=SESSION_STRING) as app:
         setup_passive_handler(app)
         setup_manual_handler(app)
-        log.info("✅ Подключено! Пассивный сбор активен + слушаю .собрать")
+        setup_broadcast_handler(app)
+        log.info("✅ Подключено! Пассивный сбор + .собрать + .рассылка активны")
         await scheduler(app)
 
 if __name__ == "__main__":
