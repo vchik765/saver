@@ -16,7 +16,7 @@ from aiogram.types import (
 )
 from aiogram.filters import Command, ChatMemberUpdatedFilter, JOIN_TRANSITION
 from aiogram.exceptions import TelegramRetryAfter
-from fun import cmd_spam, get_like_suffix, spam_running, delete_command
+from fun import cmd_spam, get_like_suffix, spam_running, delete_command, cmd_deleted_msgs
 from save import cmd_save, cmd_broadcast, auto_download, extract_url
 from cmds import (
     cmd_mute, cmd_unmute, cmd_mirror, cmd_typing, cmd_ignore, typing_running,
@@ -2327,6 +2327,14 @@ async def handle_deleted_event(event: BusinessMessagesDeleted):
         # Voicemod: изменённые голосовые/кружочки, отправленные ботом — тоже не показываем.
         if (cid, msg_id) in voicemod_sent_msgs:
             voicemod_sent_msgs.discard((cid, msg_id))
+            if cid in cache:
+                cache[cid].pop(msg_id, None)
+            continue
+        # Команды (/id, /mute, /mirror и т.п.) удаляются ботом через delete_command().
+        # Не показываем владельцу "это сообщение было удалено" — он сам их отправил,
+        # они не являются "перехваченными" удалениями.
+        if (cid, msg_id) in cmd_deleted_msgs:
+            cmd_deleted_msgs.discard((cid, msg_id))
             if cid in cache:
                 cache[cid].pop(msg_id, None)
             continue
