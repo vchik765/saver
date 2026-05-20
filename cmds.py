@@ -184,12 +184,12 @@ async def cmd_typing(message: Message, bot: Bot):
         typing_running[chat_id] = False
 
 
-async def cmd_ignore(message: Message, bot: Bot, ignore_chats: set):
+async def cmd_ignore(message: Message, bot: Bot, ignore_chats: set, owner_id: int):
     """Включает авто-игнор: бот сразу помечает входящие сообщения
     собеседника как прочитанные. Удаление команды — в bot.py приоритетно.
     Останавливается командой /stop.
     """
-    ignore_chats.add(message.chat.id)
+    ignore_chats.add((owner_id, message.chat.id))
 
 
 async def cmd_mirror(message: Message, bot: Bot, mirror_chats: set):
@@ -202,18 +202,18 @@ async def cmd_mirror(message: Message, bot: Bot, mirror_chats: set):
     pass
 
 
-async def cmd_mute(message: Message, bot: Bot, muted_chats: set):
+async def cmd_mute(message: Message, bot: Bot, muted_chats: set, owner_id: int):
     """Добавляет чат в режим мута. Все сообщения собеседника будут удаляться."""
     chat_id = message.chat.id
-    muted_chats.add(chat_id)
+    muted_chats.add((owner_id, chat_id))
     await _edit_command_to(message, bot, MUTE_TEXT)
 
 
-async def cmd_unmute(message: Message, bot: Bot, muted_chats: set):
+async def cmd_unmute(message: Message, bot: Bot, muted_chats: set, owner_id: int):
     """Снимает режим мута. Должна срабатывать с первого раза, без задержек."""
     chat_id = message.chat.id
     # Сбрасываем состояние СРАЗУ — приоритет над любыми гонками.
-    muted_chats.discard(chat_id)
+    muted_chats.discard((owner_id, chat_id))
     await _edit_command_to(message, bot, UNMUTE_TEXT)
 
 
@@ -223,6 +223,7 @@ async def cmd_troll(
     muted_chats: set,
     mirror_chats: set,  # не используется, передаётся для единообразия
     ignore_chats: set,
+    owner_id: int,
 ):
     """/troll = /mute + /ignore + /typing + рандомные mother-тексты.
 
@@ -236,10 +237,10 @@ async def cmd_troll(
     bc_id = message.business_connection_id
 
     # /mute — заглушаем собеседника
-    muted_chats.add(chat_id)
+    muted_chats.add((owner_id, chat_id))
 
     # /ignore — авто-чтение входящих
-    ignore_chats.add(chat_id)
+    ignore_chats.add((owner_id, chat_id))
 
     # /typing — постоянный индикатор «печатает…»
     if not typing_running.get(chat_id, False):
