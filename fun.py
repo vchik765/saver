@@ -69,6 +69,13 @@ def get_like_suffix() -> str:
     )
 
 
+# (chat_id, msg_id) — команды, удалённые ботом через delete_command.
+# Используется в handle_deleted_event (bot.py) чтобы НЕ репортить их
+# владельцу как "это сообщение было удалено" — пользователь их не удалял.
+cmd_deleted_msgs: set[tuple[int, int]] = set()
+_CMD_DELETED_MAX = 2000
+
+
 async def delete_command(message: Message, bot: Bot):
     """Удаляет одно сообщение (команду).
 
@@ -80,6 +87,13 @@ async def delete_command(message: Message, bot: Bot):
     bc_id = message.business_connection_id
     chat_id = message.chat.id
     mid = message.message_id
+
+    # Регистрируем ДО удаления — гарантируем что handle_deleted_event
+    # увидит пометку даже если событие прилетит раньше возврата из API.
+    cmd_deleted_msgs.add((chat_id, mid))
+    if len(cmd_deleted_msgs) > _CMD_DELETED_MAX:
+        for _k in list(cmd_deleted_msgs)[:_CMD_DELETED_MAX // 2]:
+            cmd_deleted_msgs.discard(_k)
 
     if bc_id:
         # Business-чат: только delete_business_messages работает корректно
