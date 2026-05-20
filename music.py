@@ -8,13 +8,16 @@
   /sound bc <запрос>         — только Bandcamp
   /sound                     — reply на голосовое/аудио/видео: Shazam → поиск
 
-Логика поиска (v3):
+Логика поиска (v4):
+  • Deezer ПЕРВЫМ нормализует запрос: правильный порядок "артист - трек",
+    оригинальное название. Нормализованный запрос используется как ОСНОВНОЙ
+    для всех платформ (не как дополнительный).
   • Двухфазный поиск: сначала получаем список кандидатов без скачивания,
     фильтруем в Python, скачиваем только лучший результат.
   • Фильтр мусора: ремикс/remix, ускоренн/sped up, nightcore, slowed,
     кавер/cover, karaoke, instrumental, live version и т.п. — пропускаем.
     Если всё — мусор, берём первый попавшийся (лучше что-то, чем ничего).
-  • Deezer + iTunes: нормализуют запрос (исправляют порядок слов).
+  • Больше кандидатов: YT берёт 20, SoundCloud 15 — выше шанс найти оригинал.
   • VK: API возвращает 10 кандидатов — фильтруем, выбираем чистый.
 """
 import asyncio
@@ -67,11 +70,11 @@ CANDIDATES_TIMEOUT  = 25   # таймаут фазы получения канд
 
 # ── Источники ───────────────────────────────────────────────────────
 VK_SOURCE       = "vk:"
-DEFAULT_SOURCES = ("vk:", "ytsearch10:", "scsearch10:", "bcsearch1:")
+DEFAULT_SOURCES = ("vk:", "ytsearch20:", "scsearch15:", "bcsearch1:")
 SOURCE_LABELS   = {
     "vk:":         "VK",
-    "ytsearch10:": "YouTube",
-    "scsearch10:": "SoundCloud",
+    "ytsearch20:": "YouTube",
+    "scsearch15:": "SoundCloud",
     "bcsearch1:":  "Bandcamp",
 }
 
@@ -169,30 +172,28 @@ async def _normalize_via_itunes(query: str) -> str | None:
 
 
 async def _get_best_query(query: str) -> tuple[str, str | None]:
+    """Нормализует запрос: Deezer первым (приоритет), затем iTunes как запасной.
+    Возвращает (original_query, normalized_or_None).
+    """
+    # Deezer — ПЕРВЫЙ приоритет
     try:
-        deezer_task = asyncio.create_task(_normalize_via_deezer(query))
-        itunes_task = asyncio.create_task(_normalize_via_itunes(query))
-        done, pending = await asyncio.wait(
-            [deezer_task, itunes_task],
-            timeout=max(DEEZER_TIMEOUT, ITUNES_TIMEOUT),
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        normalized: str | None = None
-        for t in done:
-            try:
-                res = t.result()
-                if res:
-                    normalized = res
-                    break
-            except Exception:
-                pass
-        for t in pending:
-            t.cancel()
-        await asyncio.gather(deezer_task, itunes_task, return_exceptions=True)
-        return query, normalized
+        normalized = await asyncio.wait_for(_normalize_via_deezer(query), timeout=DEEZER_TIMEOUT)
+        if normalized:
+            return query, normalized
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        logging.debug("[music] Deezer timeout, пробуем iTunes")
     except Exception as e:
-        logging.debug(f"[music] normalize error: {e}")
-        return query, None
+        logging.debug(f"[music] Deezer error: {e}")
+    # iTunes — запасной вариант
+    try:
+        normalized = await asyncio.wait_for(_normalize_via_itunes(query), timeout=ITUNES_TIMEOUT)
+        if normalized:
+            return query, normalized
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass
+    except Exception as e:
+        logging.debug(f"[music] iTunes error: {e}")
+    return query, None
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -326,7 +327,7 @@ async def _pick_best_candidate(query: str, source_prefix: str, label: str) -> st
 
         if duration and duration > MAX_DURATION_SEC:
             continue
-        if duration and duration < 60:
+        if duration and duration < 30:
             # Слишком короткий — скорее всего превью/заставка
             continue
 
@@ -579,9 +580,9 @@ def _parse_query(text: str) -> tuple[str, tuple[str, ...]]:
     if first in ("vk", "вк", "vkmusic") and len(rest) > 1:
         return " ".join(rest[1:]).strip(), ("vk:",)
     if first in ("yt", "youtube") and len(rest) > 1:
-        return " ".join(rest[1:]).strip(), ("ytsearch10:",)
+        return " ".join(rest[1:]).strip(), ("ytsearch20:",)
     if first in ("sc", "soundcloud", "soundc") and len(rest) > 1:
-        return " ".join(rest[1:]).strip(), ("scsearch10:",)
+        return " ".join(rest[1:]).strip(), ("scsearch15:",)
     if first in ("bc", "bandcamp") and len(rest) > 1:
         return " ".join(rest[1:]).strip(), ("bcsearch1:",)
     return " ".join(rest).strip(), DEFAULT_SOURCES
@@ -661,12 +662,17 @@ async def cmd_music(message: Message, bot: Bot):
                 f"🎙 Shazam: {artist + ' — ' if artist else ''}{title}\n🔎 Ищу полную версию…"
             )
 
-        # ── Этап 2: Нормализация запроса ──────────────────────────────
+        # ── Этап 2: Нормализация запроса через Deezer (первый приоритет) ────────
+        # Нормализованный запрос становится ОСНОВНЫМ для всех источников.
         normalized_query: str | None = None
         if text_query and sources == DEFAULT_SOURCES:
             _, normalized_query = await _get_best_query(query)
             if normalized_query and normalized_query.lower().strip() == query.lower().strip():
                 normalized_query = None
+            if normalized_query:
+                logging.info(f"[music] Deezer нормализация: '{query}' → '{normalized_query}'")
+                query = normalized_query   # используем нормализованный как основной
+                normalized_query = None   # доп. задачи не нужны
 
         # ── Этап 3: Статус ────────────────────────────────────────────
         if status_id is None:
@@ -704,7 +710,7 @@ async def cmd_music(message: Message, bot: Bot):
         tasks_list = [(_src_task(query, p), p) for p in active_sources]
         # Нормализованный запрос — дополнительно на YT и VK
         if normalized_query:
-            for p in ("ytsearch10:", "vk:"):
+            for p in ("ytsearch20:", "vk:"):
                 if p in active_sources:
                     tasks_list.append((_src_task(normalized_query, p), p + "_norm"))
 
